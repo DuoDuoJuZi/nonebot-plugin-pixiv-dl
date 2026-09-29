@@ -14,6 +14,14 @@
 
 ## 💿 安装
 
+推荐使用 NB-CLI 安装
+
+```bash
+nb plugin install nonebot-plugin-pixiv-dl
+```
+
+也可以使用 pip 安装
+
 ```bash
 pip install nonebot-plugin-pixiv-dl
 ```
