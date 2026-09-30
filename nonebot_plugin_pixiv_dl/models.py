@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 # @Date: 2026-09-29
 @dataclass(slots=True)
 class Artwork:
-    """保存插画和漫画搜索结果及下载消息所需的作品信息"""
+    """保存插画和漫画的元数据，搜索预览地址及下载图片地址"""
 
     id: int
     title: str
@@ -17,6 +17,7 @@ class Artwork:
     x_restrict: int
     description: str = ""
     urls: list[str] = field(default_factory=list)
+    preview_url: str | None = None
 
     @property
     def is_r18(self) -> bool:

@@ -14,6 +14,7 @@ from .message import (
     build_search_forward,
     format_novel,
     format_series,
+    process_preview,
     send_forward,
     write_novel_file,
 )
@@ -26,6 +27,7 @@ KINDS = {"图片": "image", "漫画": "manga", "小说": "novel"}
 
 config = get_plugin_config(Config)
 client = PixivClient(config)
+preview_semaphore = asyncio.Semaphore(config.pixiv_preview_concurrency)
 get_driver().on_shutdown(client.close)
 
 search_matcher = on_regex(SEARCH_RE.pattern, priority=10, block=True)
@@ -101,8 +103,54 @@ async def _search_kind(kind: str, word: str) -> list[Artwork] | list[Novel]:
     return await method(word, config.pixiv_search_limit)
 
 
+async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
+    """有限并发下载搜索预览，单张失败时保留对应作品的元数据
+
+    Args:
+        items: 按搜索顺序排列的插画或漫画元数据
+
+    Returns:
+        按作品 ID 保存的成功处理预览，关闭预览时返回空字典
+    """
+    if not config.pixiv_search_preview:
+        return {}
+
+    async def load(item: Artwork) -> bytes | None:
+        """下载并处理单部作品的预览，限制级处理失败时不返回原始图片
+
+        Args:
+            item: 包含预览地址与限制级标记的作品元数据
+
+        Returns:
+            已处理的 JPEG 内容，地址缺失或处理失败时返回 None
+        """
+        if not item.preview_url:
+            return None
+        try:
+            async with preview_semaphore:
+                data = await client.download_image(item.preview_url)
+                return await asyncio.to_thread(
+                    process_preview, data, item.is_r18, config.pixiv_preview_max_edge
+                )
+        except Exception as exc:
+            logger.warning(
+                "Pixiv 预览处理失败，作品 ID={}，URL={}，异常={}",
+                item.id,
+                item.preview_url,
+                exc,
+            )
+            return None
+
+    previews = await asyncio.gather(*(load(item) for item in items))
+    return {
+        item.id: data
+        for item, data in zip(items, previews, strict=True)
+        if data is not None
+    }
+
+
 async def _run_search(bot: Bot, event: MessageEvent, kind: str, word: str) -> None:
-    """查询作品预览并撤回状态提示，按分类发送合并转发
+    """查询元数据和低清预览并撤回状态提示，按分类发送合并转发
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
@@ -115,6 +163,9 @@ async def _run_search(bot: Bot, event: MessageEvent, kind: str, word: str) -> No
     try:
         kinds = ["image", "manga", "novel"] if kind == "all" else [kind]
         results = await asyncio.gather(*(_search_kind(item, word) for item in kinds))
+        previews = await _search_previews(
+            [item for items in results for item in items if isinstance(item, Artwork)]
+        )
         await _recall(bot, status)
         recalled = True
         if all(not items for items in results):
@@ -125,7 +176,7 @@ async def _run_search(bot: Bot, event: MessageEvent, kind: str, word: str) -> No
                 await bot.send(event, f"没有搜索到相关{KIND_NAMES[current]}")
                 continue
             packets = build_search_forward(
-                items, current, config.pixiv_forward_max_messages, int(bot.self_id)
+                items, current, config.pixiv_forward_max_messages, int(bot.self_id), previews
             )
             for packet in packets:
                 await send_forward(bot, event, packet)

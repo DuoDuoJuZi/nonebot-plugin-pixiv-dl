@@ -151,15 +151,48 @@ def _description(value: object) -> str:
     return html.unescape(re.sub(r"<[^>]*>", "", str(value or ""))).strip()
 
 
+def _preview_url(item: dict) -> str | None:
+    """从搜索响应选择第一页低清地址，跳过原图和未裁剪的常规图片
+
+    Args:
+        item: 搜索接口返回的单个作品对象，可能包含多种图片尺寸
+
+    Returns:
+        接口提供的可信预览地址，没有可用低清地址时返回 None
+    """
+    urls = item.get("urls")
+    urls = urls if isinstance(urls, dict) else {}
+    candidates = [item.get("url")]
+    for key in ("thumb", "thumbnail", "small"):
+        candidates.extend((item.get(key), urls.get(key)))
+    for url in candidates:
+        if not isinstance(url, str):
+            continue
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".pximg.net"):
+                continue
+        except ValueError:
+            continue
+        path = parsed.path.lower()
+        if "img-original" in path or ("img-master" in path and not path.startswith("/c/")):
+            continue
+        page = re.search(r"_p(\d+)(?:[_.]|$)", path)
+        if page and int(page.group(1)) != 0:
+            continue
+        return url
+    return None
+
+
 def _search_artwork(item: dict, kind: str) -> Artwork:
-    """将搜索预览转换为插画或漫画模型
+    """将搜索结果转换为包含低清预览地址的插画或漫画模型
 
     Args:
         item: 搜索接口返回的单个作品预览对象
         kind: 预览所属的插画或漫画分类
 
     Returns:
-        可用于消息展示的作品元数据
+        可用于消息展示的作品元数据和第一页预览地址
     """
     return Artwork(
         id=int(item["id"]),
@@ -170,6 +203,7 @@ def _search_artwork(item: dict, kind: str) -> Artwork:
         type=kind,
         page_count=int(item.get("pageCount") or 1),
         x_restrict=int(item.get("xRestrict") or 0),
+        preview_url=_preview_url(item),
     )
 
 
@@ -197,7 +231,7 @@ def _search_novel(item: dict) -> Novel:
 
 
 class PixivClient:
-    """复用 HTTPX 客户端完成 Pixiv 数据查询和原图下载"""
+    """复用 HTTPX 客户端完成 Pixiv 数据查询和图片下载"""
 
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """创建共享请求客户端，将 Cookie 限定于 Pixiv 主站并配置统一代理
@@ -557,13 +591,13 @@ class PixivClient:
         return series
 
     async def download_image(self, url: str) -> bytes:
-        """从 Pixiv 图片服务器下载原图
+        """从 Pixiv 图片服务器下载缩略图或原图
 
         Args:
-            url: Pixiv 图片域名下的 HTTPS 原图地址
+            url: Pixiv 图片域名下由接口提供的 HTTPS 图片地址
 
         Returns:
-            非空的原图二进制内容
+            非空的图片二进制内容
 
         Raises:
             PixivAPIError: 地址不可信或 HTTP 状态和图片内容无效

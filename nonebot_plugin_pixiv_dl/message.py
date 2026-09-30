@@ -1,4 +1,5 @@
 import re
+from io import BytesIO
 from pathlib import Path
 
 from nonebot.adapters.onebot.v11 import (
@@ -8,6 +9,7 @@ from nonebot.adapters.onebot.v11 import (
     MessageEvent,
     MessageSegment,
 )
+from PIL import Image, ImageFilter
 
 from .models import Artwork, Novel, NovelSeries
 
@@ -93,30 +95,65 @@ def format_series(series: NovelSeries, downloaded: int) -> str:
     )
 
 
-def build_search_forward(
-    items: list[Artwork] | list[Novel], kind: str, max_messages: int, self_id: int
-) -> list[list[MessageSegment]]:
-    """按节点上限拆分搜索结果，每个节点展示一部作品的元数据
+def process_preview(data: bytes, is_r18: bool, max_edge: int) -> bytes:
+    """在内存中缩放预览并编码为 JPEG，限制级作品始终进行高斯模糊
 
     Args:
-        items: 按搜索结果顺序排列的同分类作品预览
+        data: 从搜索接口提供的预览地址下载的图片内容
+        is_r18: 作品是否被 Pixiv 标记为限制级内容
+        max_edge: 处理后图片最长边的像素上限
+
+    Returns:
+        保持宽高比并以白底处理透明通道的 JPEG 内容，质量为 80
+
+    Raises:
+        OSError: 图片无法解码或编码
+        ValueError: 图片处理参数或颜色模式无效
+    """
+    with Image.open(BytesIO(data)) as source:
+        source.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        rgba = source.convert("RGBA")
+        image = Image.new("RGB", rgba.size, "white")
+        image.paste(rgba, mask=rgba.getchannel("A"))
+        if is_r18:
+            radius = max(12.0, min(48.0, min(image.size) * 0.1))
+            image = image.filter(ImageFilter.GaussianBlur(radius))
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=80, optimize=True)
+        return output.getvalue()
+
+
+def build_search_forward(
+    items: list[Artwork] | list[Novel],
+    kind: str,
+    max_messages: int,
+    self_id: int,
+    previews: dict[int, bytes] | None = None,
+) -> list[list[MessageSegment]]:
+    """按结果数量拆分搜索转发，每个作品节点包含元数据和可用的预览
+
+    Args:
+        items: 按搜索结果顺序排列的同分类作品元数据
         kind: 请求的作品分类
         max_messages: 每个合并转发允许的最大节点数，至少为 1
         self_id: 合并转发节点使用的机器人 QQ 号
+        previews: 按作品 ID 保存的已处理预览内容，空值表示仅展示元数据
 
     Returns:
         按结果顺序排列的合并转发分包列表
     """
     packets = []
     for start in range(0, len(items), max_messages):
-        packet = [
-            MessageSegment.node_custom(
-                self_id,
-                f"Pixiv {KIND_NAMES[kind]}",
-                format_novel(item) if isinstance(item, Novel) else format_artwork(item),
+        packet = []
+        for item in items[start : start + max_messages]:
+            content = format_novel(item) if isinstance(item, Novel) else format_artwork(item)
+            if isinstance(item, Artwork) and previews and item.id in previews:
+                content = Message(
+                    [MessageSegment.text(content), MessageSegment.image(previews[item.id])]
+                )
+            packet.append(
+                MessageSegment.node_custom(self_id, f"Pixiv {KIND_NAMES[kind]}", content)
             )
-            for item in items[start : start + max_messages]
-        ]
         packets.append(packet)
     return packets
 
