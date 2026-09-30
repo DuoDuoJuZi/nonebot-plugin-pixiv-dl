@@ -225,7 +225,7 @@ def test_aggregate_previews_leave_novels_as_metadata(monkeypatch) -> None:
 
 
 def test_r18_uses_xrestrict_and_sends_decodable_blurred_bytes(monkeypatch) -> None:
-    """验证无 R18 标签的限制级作品仍发送真实模糊后的 JPEG
+    """验证限制级作品使用轻度模糊并保留局部对比度，输出可解码的 JPEG
 
     Args:
         monkeypatch: 用于临时替换请求客户端与消息接口的 pytest 工具
@@ -259,6 +259,8 @@ def test_r18_uses_xrestrict_and_sends_decodable_blurred_bytes(monkeypatch) -> No
         assert blurred.format == "JPEG"
         assert blurred.size == (512, 256)
         assert ImageChops.difference(blurred, plain).getbbox() is not None
+        darkest, brightest = blurred.convert("L").crop((32, 32, 480, 224)).getextrema()
+        assert brightest - darkest > 100
 
 
 def test_preview_composites_transparency_on_white_without_upscaling() -> None:

@@ -96,7 +96,7 @@ def format_series(series: NovelSeries, downloaded: int) -> str:
 
 
 def process_preview(data: bytes, is_r18: bool, max_edge: int) -> bytes:
-    """在内存中缩放预览并编码为 JPEG，限制级作品始终进行高斯模糊
+    """在内存中缩放预览并编码为 JPEG，限制级作品始终进行轻度高斯模糊
 
     Args:
         data: 从搜索接口提供的预览地址下载的图片内容
@@ -116,7 +116,7 @@ def process_preview(data: bytes, is_r18: bool, max_edge: int) -> bytes:
         image = Image.new("RGB", rgba.size, "white")
         image.paste(rgba, mask=rgba.getchannel("A"))
         if is_r18:
-            radius = max(12.0, min(48.0, min(image.size) * 0.1))
+            radius = max(1.0, min(3.0, min(image.size) * 0.01))
             image = image.filter(ImageFilter.GaussianBlur(radius))
         output = BytesIO()
         image.save(output, format="JPEG", quality=80, optimize=True)
