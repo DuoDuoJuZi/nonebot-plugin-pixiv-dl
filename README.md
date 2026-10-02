@@ -135,3 +135,8 @@ PIXIV_PROXY="http://127.0.0.1:7890"
 - 图片下载失败时，检查 `i.pximg.net` 的网络连接或代理设置
 - 固定 IP 无法连接时，清空 `PIXIV_FIXED_IP` 以恢复系统 DNS
 - 小说文件发送失败时，确认实现端支持合并转发中的 `file` 消息段，且能访问本地临时文件
+
+## 🙏 特别鸣谢
+
+- [pixiv-api-http](https://github.com/Dituon/pixiv-api-http)，提供 Pixiv 网页接口实现参考
+- [nonebot-plugin-jmdownloader](https://github.com/Misty02600/nonebot-plugin-jmdownloader)，提供 README 结构参考
