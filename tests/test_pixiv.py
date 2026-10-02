@@ -113,11 +113,12 @@ def test_search_categories_empty_results_and_r18_filter() -> None:
             images = await client.search_artworks("初音", 20)
             manga = await client.search_manga("初音", 20)
             novels = await client.search_novels("初音", 20)
-            assert [item.id for item in images] == [11]
-            assert images[0].page_count == 2
-            assert not images[0].is_r18
-            assert [item.type for item in manga] == ["manga"]
-            assert novels == []
+            assert [item.id for item in images.items] == [11]
+            assert images.items[0].page_count == 2
+            assert not images.items[0].is_r18
+            assert [item.type for item in manga.items] == ["manga"]
+            assert novels.items == []
+            assert not any(page.has_next for page in (images, manga, novels))
         finally:
             await client.close()
 
@@ -156,7 +157,9 @@ def test_search_paginates_without_dropping_or_repeating_results() -> None:
         client = make_client(handler)
         try:
             results = await client.search_artworks("画", 61)
-            assert [item.id for item in results] == list(range(61))
+            assert [item.id for item in results.items] == list(range(61))
+            assert results.page == 2
+            assert results.has_next is False
         finally:
             await client.close()
 
@@ -424,6 +427,121 @@ def test_image_rejects_untrusted_urls_and_redirects() -> None:
                 await client.download_image("https://example.org/image.jpg")
             with pytest.raises(PixivAPIError):
                 await client.download_image("https://i.pximg.net/image.jpg")
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("metadata", "page", "count", "expected"),
+    [
+        ({"total": 61}, 1, 1, True),
+        ({"total": 60}, 1, 60, False),
+        ({"total": 120}, 2, 60, False),
+        ({"total": 121}, 2, 1, True),
+        ({"total": 999, "lastPage": 2}, 2, 60, False),
+        ({"lastPage": 3}, 2, 1, True),
+        ({"total": "121"}, 2, 1, True),
+        ({"total": 0}, 1, 0, False),
+        ({"total": 999}, 2, 0, False),
+        ({}, 1, 60, True),
+        ({}, 1, 59, False),
+        ({}, 1, 1, False),
+        ({}, 1, 0, False),
+    ],
+)
+def test_search_page_uses_metadata_before_raw_count(
+    metadata: dict, page: int, count: int, expected: bool
+) -> None:
+    """验证下一页优先依据分页元数据而不是配置上限或过滤后数量
+
+    Args:
+        metadata: 当前接口返回的总数或末页字段，空字典表示没有分页信息
+        page: 当前请求的实际 Pixiv 页码
+        count: 原始响应中的作品数量
+        expected: 当前响应是否应允许继续下一页
+    """
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """记录请求并返回指定分页元数据
+
+        Args:
+            request: 含有真实页码参数的搜索请求
+
+        Returns:
+            包含原始数量和场景分页字段的模拟响应
+        """
+        requests.append(request)
+        items = [{"id": index + 1} for index in range(count)]
+        return ajax({"illust": {"data": items, **metadata}})
+
+    async def scenario():
+        """保持每批上限为 1 并验证分页不依赖展示数量"""
+        client = make_client(handler)
+        try:
+            result = await client.search_artworks("测试", 1, page)
+            assert result.page == page
+            assert result.has_next is expected
+            assert len(result.items) == min(count, 1)
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert [request.url.params["p"] for request in requests] == [str(page)]
+
+
+def test_search_cursor_tracks_last_native_page_for_large_batch() -> None:
+    """验证跨页补足现有数量上限后从实际下一页继续且不混用转发分包"""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """按实际页码生成互不重叠的模拟作品
+
+        Args:
+            request: 指定当前 Pixiv 页码的搜索请求
+
+        Returns:
+            每页 60 条且总计 180 条的搜索响应
+        """
+        page = int(request.url.params["p"])
+        seen.append(page)
+        items = [{"id": (page - 1) * 60 + index} for index in range(1, 61)]
+        return ajax({"illust": {"data": items, "total": 180}})
+
+    async def scenario():
+        """先读取跨两页的现有搜索批次再查询后续一页"""
+        client = make_client(handler)
+        try:
+            first = await client.search_artworks("测试", 61)
+            assert first.page == 2
+            assert first.has_next
+            assert [item.id for item in first.items] == list(range(1, 62))
+            following = await client.search_artworks("测试", 61, first.page + 1)
+            assert following.page == 3
+            assert not following.has_next
+            assert following.items[0].id == 121
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert seen == [1, 2, 3]
+
+
+@pytest.mark.parametrize("metadata", [{"total": "无效"}, {"lastPage": []}])
+def test_search_rejects_malformed_pagination(metadata: dict) -> None:
+    """验证错误分页信息不会被当作成功结果
+
+    Args:
+        metadata: 当前模拟响应中无效的分页字段
+    """
+    async def scenario():
+        """请求带无效元数据的搜索页并检查异常分类"""
+        client = make_client(lambda request: ajax({"illust": {"data": [], **metadata}}))
+        try:
+            with pytest.raises(PixivAPIError, match="分页信息无效"):
+                await client.search_artworks("测试", 20, 2)
         finally:
             await client.close()
 

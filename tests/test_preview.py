@@ -78,7 +78,7 @@ async def run_search(monkeypatch, handler, kind: str = "image", **options) -> li
         send=AsyncMock(return_value={"message_id": 99}),
         delete_msg=AsyncMock(),
     )
-    event = object()
+    event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
     monkeypatch.setattr(commands, "config", config)
     monkeypatch.setattr(commands, "client", client)
     monkeypatch.setattr(
@@ -423,3 +423,142 @@ def test_preview_config_defaults_and_limits() -> None:
     ):
         with pytest.raises(ValidationError):
             Config(**options)
+
+
+@pytest.mark.parametrize("kind", ["image", "manga", "novel", "all"])
+def test_next_page_preserves_previews_blur_metadata_and_packets(monkeypatch, kind: str) -> None:
+    """验证真实客户端翻页仍共用预览处理和按作品分包的展示流程
+
+    Args:
+        monkeypatch: 临时替换外部网络与 OneBot 发送接口的 pytest 工具
+        kind: 本次验证的单分类或聚合搜索模式
+    """
+    source = Image.new("RGB", (1024, 512), "white")
+    for left in range(0, 1024, 32):
+        source.paste("black", (left, 0, left + 16, 512))
+    data = png(source)
+    requests = []
+    actions = []
+    packets = []
+    kinds = ["image", "manga", "novel"] if kind == "all" else [kind]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """提供两页不同作品并拒绝原图与额外详情查询
+
+        Args:
+            request: 搜索分页请求或低清预览请求
+
+        Returns:
+            当前 Pixiv 页元数据或用于检查模糊的合成图片
+        """
+        requests.append(request)
+        if request.url.host == "www.pixiv.net":
+            assert request.url.path.startswith("/ajax/search/")
+            route = request.url.path.split("/")[3]
+            section, illust_type = {
+                "illustrations": ("illust", 0),
+                "manga": ("manga", 1),
+                "novels": ("novel", 0),
+            }[route]
+            page = int(request.url.params["p"])
+            items = [
+                {
+                    "id": page * 10 + index,
+                    "title": f"作品 {index}",
+                    "userName": "作者",
+                    "illustType": illust_type,
+                    "pageCount": 22,
+                    "url": preview_url(page * 10 + index),
+                    "xRestrict": index == 1,
+                    "seriesId": 99,
+                    "seriesTitle": "系列",
+                    "description": "简介",
+                }
+                for index in (1, 2, 3)
+            ]
+            return httpx.Response(
+                200, json={"error": False, "body": {section: {"data": items, "total": 120}}}
+            )
+        assert "/c/250x250_80_a2/" in request.url.path
+        assert "_p0_" in request.url.path
+        assert "cookie" not in request.headers
+        return httpx.Response(200, content=data, headers={"content-type": "image/png"})
+
+    async def send(event, content):
+        """收集状态与页码提示的发送顺序
+
+        Args:
+            event: 触发测试搜索的消息上下文
+            content: 状态或分页提示文本
+
+        Returns:
+            用于撤回状态提示的模拟消息标识
+        """
+        actions.append(("message", content))
+        return {"message_id": 77}
+
+    async def recall(*, message_id):
+        """记录状态消息撤回顺序
+
+        Args:
+            message_id: 待撤回的状态提示标识
+        """
+        actions.append(("recall", message_id))
+
+    async def forward(bot, event, packet):
+        """收集实际构造的搜索转发节点
+
+        Args:
+            bot: 发送消息的模拟机器人
+            event: 触发搜索的聊天环境
+            packet: 当前分类的一组合并转发节点
+        """
+        actions.append(("forward", len(packet)))
+        packets.append(packet)
+
+    async def scenario():
+        """执行真实客户端首批查询与下一页并检查实际发送内容"""
+        config = Config(
+            pixiv_cookie="PHPSESSID=test", pixiv_search_limit=3, pixiv_forward_max_messages=2
+        )
+        client = PixivClient(config, httpx.MockTransport(handler))
+        bot = SimpleNamespace(self_id="10", send=send, delete_msg=recall)
+        event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
+        monkeypatch.setattr(commands, "config", config)
+        monkeypatch.setattr(commands, "client", client)
+        monkeypatch.setattr(commands, "preview_semaphore", asyncio.Semaphore(4))
+        monkeypatch.setattr(commands, "send_forward", forward)
+        try:
+            await commands._run_search(bot, event, kind, "测试")
+            packets.clear()
+            actions.clear()
+            await commands._run_next(bot, event)
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert actions[:2] == [("message", "正在搜索"), ("recall", 77)]
+    assert [len(packet) for packet in packets] == [2, 1] * len(kinds)
+    assert "第 2 页" in actions[-1][1]
+    assert "已经没有下一页" in actions[-1][1]
+    for index, category in enumerate(kinds):
+        nodes = packets[index * 2] + packets[index * 2 + 1]
+        assert all(
+            node.data["nickname"] == f"Pixiv {message.KIND_NAMES[category]}" for node in nodes
+        )
+        if category == "novel":
+            assert all(isinstance(node.data["content"], str) for node in nodes)
+            assert "小说 ID：21" in nodes[0].data["content"]
+            assert "系列 ID：99" in nodes[0].data["content"]
+        else:
+            assert "PID：21" in nodes[0].data["content"][0].data["text"]
+            assert "作品总页数：22" in nodes[0].data["content"][0].data["text"]
+            blurred = image_bytes(nodes[0])
+            assert blurred == message.process_preview(data, True, 512)
+            assert blurred != message.process_preview(data, False, 512)
+            with Image.open(BytesIO(blurred)) as image:
+                assert image.size == (512, 256)
+    search_requests = [request for request in requests if request.url.host == "www.pixiv.net"]
+    assert [request.url.params["p"] for request in search_requests] == ["1"] * len(kinds) + [
+        "2"
+    ] * len(kinds)

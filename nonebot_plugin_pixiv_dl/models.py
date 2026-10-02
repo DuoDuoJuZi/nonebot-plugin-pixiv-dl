@@ -75,3 +75,12 @@ class NovelSeries:
             限制级标记大于 0 时返回 True，否则返回 False
         """
         return self.x_restrict > 0
+
+
+@dataclass(slots=True)
+class SearchPage:
+    """保存本批搜索预览，最后读取的 Pixiv 页码和后续页标记"""
+
+    items: list[Artwork] | list[Novel]
+    page: int
+    has_next: bool

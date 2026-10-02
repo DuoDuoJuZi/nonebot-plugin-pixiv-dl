@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from nonebot import get_driver, get_plugin_config, logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 
+from . import pagination
 from .config import Config
 from .message import (
     KIND_NAMES,
@@ -18,10 +19,15 @@ from .message import (
     send_forward,
     write_novel_file,
 )
-from .models import Artwork, Novel
+from .models import Artwork, Novel, SearchPage
+from .pagination import SearchCursor, SearchSession, prune_sessions, session_key, sessions
 from .pixiv import PixivAPIError, PixivClient, PixivNotFoundError, PixivR18Error
 
-SEARCH_RE = re.compile(r"^/px搜索(?!(?:图片|漫画|小说)\s*$)(图片|漫画|小说)?\s*(\S.*?)\s*$")
+SEARCH_RE = re.compile(
+    r"^/px搜索(?!(?:图片|漫画|小说)?下一页\s*$)"
+    r"(?!(?:图片|漫画|小说)\s*$)(图片|漫画|小说)?\s*(\S.*?)\s*$"
+)
+NEXT_RE = re.compile(r"^/px搜索(图片|漫画|小说)?下一页\s*$")
 DOWNLOAD_RE = re.compile(r"^/px下载(图片|漫画|小说)?\s*(\d+)\s*$")
 KINDS = {"图片": "image", "漫画": "manga", "小说": "novel"}
 
@@ -31,6 +37,7 @@ preview_semaphore = asyncio.Semaphore(config.pixiv_preview_concurrency)
 get_driver().on_shutdown(client.close)
 
 search_matcher = on_regex(SEARCH_RE.pattern, priority=10, block=True)
+next_matcher = on_regex(NEXT_RE.pattern, priority=9, block=True)
 download_matcher = on_regex(DOWNLOAD_RE.pattern, priority=10, block=True)
 
 
@@ -79,15 +86,16 @@ async def _recall(bot: Bot, status: dict) -> None:
         logger.warning("Pixiv 状态消息撤回失败", exc_info=True)
 
 
-async def _search_kind(kind: str, word: str) -> list[Artwork] | list[Novel]:
+async def _search_kind(kind: str, word: str, page: int) -> SearchPage:
     """调用指定分类的 Pixiv 搜索接口
 
     Args:
         kind: 请求的作品分类
         word: 用于匹配作品标签的搜索关键词
+        page: 本批查询起始的 Pixiv 页码
 
     Returns:
-        符合配置数量上限的该分类作品预览
+        符合配置数量上限的该分类预览及实际分页信息
 
     Raises:
         PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
@@ -100,7 +108,7 @@ async def _search_kind(kind: str, word: str) -> list[Artwork] | list[Novel]:
         "manga": client.search_manga,
         "novel": client.search_novels,
     }[kind]
-    return await method(word, config.pixiv_search_limit)
+    return await method(word, config.pixiv_search_limit, page)
 
 
 async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
@@ -142,49 +150,224 @@ async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
             return None
 
     previews = await asyncio.gather(*(load(item) for item in items))
-    return {
-        item.id: data
-        for item, data in zip(items, previews, strict=True)
-        if data is not None
-    }
+    return {item.id: data for item, data in zip(items, previews, strict=True) if data is not None}
 
 
-async def _run_search(bot: Bot, event: MessageEvent, kind: str, word: str) -> None:
-    """查询元数据和低清预览并撤回状态提示，按分类发送合并转发
+def _pagination_hint(session: SearchSession) -> str:
+    """根据独立分类游标生成真实可用的翻页提示
+
+    Args:
+        session: 保存当前模式和成功查询页码的分页记录
+
+    Returns:
+        当前页码和仍然允许使用的翻页命令，无剩余页时说明已结束
+    """
+    pages = "，".join(
+        f"{KIND_NAMES[kind]}第 {cursor.page} 页"
+        for kind, cursor in session.cursors.items()
+        if cursor.page
+    )
+    available = [kind for kind, cursor in session.cursors.items() if cursor.has_next]
+    if not available:
+        return f"当前{pages}，已经没有下一页"
+    names = "、".join(KIND_NAMES[kind] for kind in available)
+    branches = " 或 ".join(f"/px搜索{KIND_NAMES[kind]}下一页" for kind in available)
+    choice = "，选择分类成功后仅继续该分类" if session.kind == "all" else ""
+    return (
+        f"当前{pages}\n{names}还有下一页，可使用 /px搜索下一页 继续搜索，或使用 {branches}{choice}"
+    )
+
+
+async def _search_and_send(
+    bot: Bot,
+    event: MessageEvent,
+    session: SearchSession,
+    targets: dict[str, int],
+    selected: str | None = None,
+) -> None:
+    """共用搜索与预览发送流程，仅推进成功解析的分类游标
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
         event: 触发命令的消息事件，决定回复会话
-        kind: 搜索分类，all 表示分别查询插画，漫画和小说
-        word: 用于匹配作品标签的搜索关键词
+        session: 当前持有独立锁的搜索记录
+        targets: 每个待查询分类对应的实际起始页码
+        selected: 显式选择的分页分类，成功后将聚合模式收窄至该分类
     """
-    status = await bot.send(event, "正在搜索")
-    recalled = False
+    key = session_key(bot, event)
+    status = None
+    previous = {kind: session.cursors[kind].page for kind in targets}
+    aggregate = session.kind == "all"
     try:
-        kinds = ["image", "manga", "novel"] if kind == "all" else [kind]
-        results = await asyncio.gather(*(_search_kind(item, word) for item in kinds))
+        status = await bot.send(event, "正在搜索")
+        results = await asyncio.gather(
+            *(_search_kind(kind, session.word, page) for kind, page in targets.items()),
+            return_exceptions=True,
+        )
+        if sessions.get(key) is not session:
+            return
+        successful = {
+            kind: result
+            for kind, result in zip(targets, results, strict=True)
+            if isinstance(result, SearchPage)
+        }
+        for kind, result in successful.items():
+            session.cursors[kind] = SearchCursor(result.page, result.has_next)
+        if successful and session.expires_at is None:
+            session.expires_at = pagination.monotonic() + 120
+        if selected in successful:
+            session.kind = selected
+            session.cursors = {selected: session.cursors[selected]}
         previews = await _search_previews(
-            [item for items in results for item in items if isinstance(item, Artwork)]
+            [
+                item
+                for result in successful.values()
+                for item in result.items
+                if isinstance(item, Artwork)
+            ]
         )
         await _recall(bot, status)
-        recalled = True
-        if all(not items for items in results):
-            await bot.send(event, "没有搜索到相关内容")
+        status = None
+        if sessions.get(key) is not session:
             return
-        for current, items in zip(kinds, results, strict=True):
-            if not items:
-                await bot.send(event, f"没有搜索到相关{KIND_NAMES[current]}")
-                continue
-            packets = build_search_forward(
-                items, current, config.pixiv_forward_max_messages, int(bot.self_id), previews
+        if len(successful) == len(targets) and all(not page.items for page in successful.values()):
+            await bot.send(event, "没有搜索到相关内容")
+        else:
+            for current, result in zip(targets, results, strict=True):
+                if sessions.get(key) is not session:
+                    return
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "Pixiv 搜索分页失败，关键词={}，分类={}，当前页={}，目标页={}，"
+                        "上下文={}，聚合={}，异常={}",
+                        session.word,
+                        current,
+                        previous[current],
+                        targets[current],
+                        key,
+                        aggregate,
+                        str(result),
+                    )
+                    await bot.send(event, f"{KIND_NAMES[current]}搜索失败，请重试")
+                    continue
+                if not result.items:
+                    await bot.send(event, f"没有搜索到相关{KIND_NAMES[current]}")
+                    continue
+                try:
+                    packets = build_search_forward(
+                        result.items,
+                        current,
+                        config.pixiv_forward_max_messages,
+                        int(bot.self_id),
+                        previews,
+                    )
+                    for packet in packets:
+                        if sessions.get(key) is not session:
+                            return
+                        await send_forward(bot, event, packet)
+                except Exception as exc:
+                    logger.error(
+                        "Pixiv 搜索结果发送失败，关键词={}，分类={}，当前页={}，目标页={}，"
+                        "上下文={}，聚合={}，异常={}",
+                        session.word,
+                        current,
+                        previous[current],
+                        targets[current],
+                        key,
+                        aggregate,
+                        type(exc).__name__,
+                    )
+                    await bot.send(event, f"{KIND_NAMES[current]}搜索结果发送失败")
+        if (
+            successful
+            and sessions.get(key) is session
+            and (
+                any(cursor.has_next for cursor in session.cursors.values())
+                or any(page > 1 for page in targets.values())
             )
-            for packet in packets:
-                await send_forward(bot, event, packet)
-    except Exception:
-        logger.exception("Pixiv 搜索失败，分类={}，关键词={}", kind, word)
-        if not recalled:
+        ):
+            await bot.send(event, _pagination_hint(session))
+    except Exception as exc:
+        logger.error(
+            "Pixiv 搜索失败，关键词={}，当前页={}，目标页={}，上下文={}，聚合={}，异常={}",
+            session.word,
+            previous,
+            targets,
+            key,
+            aggregate,
+            type(exc).__name__,
+        )
+        if status is not None:
             await _recall(bot, status)
+            status = None
         await bot.send(event, "搜索失败")
+    finally:
+        if status is not None:
+            await _recall(bot, status)
+
+
+async def _run_search(bot: Bot, event: MessageEvent, kind: str, word: str) -> None:
+    """以新的搜索意图替换旧会话，首次查询成功后开始固定有效期
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 触发命令的消息事件，决定用户与聊天环境
+        kind: 搜索分类，all 表示聚合搜索
+        word: 用于匹配作品标签的搜索关键词
+    """
+    prune_sessions()
+    key = session_key(bot, event)
+    kinds = list(KINDS.values()) if kind == "all" else [kind]
+    session = SearchSession(word, kind, {item: SearchCursor() for item in kinds})
+    sessions[key] = session
+    try:
+        async with session.lock:
+            await _search_and_send(bot, event, session, dict.fromkeys(kinds, 1))
+    finally:
+        if session.expires_at is None and sessions.get(key) is session:
+            del sessions[key]
+
+
+async def _run_next(bot: Bot, event: MessageEvent, selected: str | None = None) -> None:
+    """串行处理当前用户的下一页请求，获得锁后重新检查有效期和分类
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 触发命令的消息事件，决定用户与聊天环境
+        selected: 指定继续的分类，空值表示继续当前模式中的全部可用分类
+    """
+    key = session_key(bot, event)
+    session = sessions.get(key)
+    prune_sessions()
+    if session is None:
+        await bot.send(event, "没有可继续的搜索记录，请先进行搜索")
+        return
+    async with session.lock:
+        if session.expired():
+            if sessions.get(key) is session:
+                del sessions[key]
+            await bot.send(event, "搜索记录已超时，请重新搜索")
+            return
+        if sessions.get(key) is not session:
+            await bot.send(event, "搜索记录已更新，请重新发送下一页命令")
+            return
+        if selected and session.kind not in ("all", selected):
+            await bot.send(
+                event,
+                f"当前分页搜索已锁定为{KIND_NAMES[session.kind]}，"
+                "请使用 /px搜索下一页 继续搜索，或重新发起搜索",
+            )
+            return
+        targets = {
+            kind: cursor.page + 1
+            for kind, cursor in session.cursors.items()
+            if cursor.has_next and (selected is None or kind == selected)
+        }
+        if not targets:
+            label = KIND_NAMES[selected] if selected else ""
+            await bot.send(event, f"{label}已经没有下一页，请重新搜索")
+            return
+        await _search_and_send(bot, event, session, targets, selected)
 
 
 async def _get_download_target(kind: str, work_id: int) -> Artwork | Novel:
@@ -314,3 +497,16 @@ async def handle_download(bot: Bot, event: MessageEvent) -> None:
     parsed = parse_download(event.get_plaintext())
     if parsed:
         await _run_download(bot, event, *parsed)
+
+
+@next_matcher.handle()
+async def handle_next(bot: Bot, event: MessageEvent) -> None:
+    """解析不带关键词的翻页命令并继续当前用户的分页记录
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 触发翻页命令的 OneBot 消息事件
+    """
+    match = NEXT_RE.fullmatch(event.get_plaintext())
+    if match:
+        await _run_next(bot, event, KINDS.get(match.group(1)))

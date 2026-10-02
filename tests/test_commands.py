@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from nonebot_plugin_pixiv_dl import commands
-from nonebot_plugin_pixiv_dl.models import Artwork, Novel, NovelSeries
+from nonebot_plugin_pixiv_dl.models import Artwork, Novel, NovelSeries, SearchPage
 from nonebot_plugin_pixiv_dl.pixiv import PixivNotFoundError
 
 
@@ -97,20 +97,21 @@ def test_aggregate_search_sends_three_separate_forward_records(monkeypatch) -> N
             """
             actions.append(("recall", message_id))
 
-    async def search_kind(kind, word):
+    async def search_kind(kind, word, page):
         """为指定搜索分类提供一条模拟预览
 
         Args:
             kind: 请求的作品分类
             word: 用于匹配作品标签的搜索关键词
+            page: 本次请求的 Pixiv 搜索页码
 
         Returns:
-            包含该分类单个作品的预览列表
+            包含该分类单个作品和无后续页标记的搜索结果
         """
         assert word == "初音"
         if kind == "novel":
-            return [Novel(3, "小说", 2, "作者", [], 0)]
-        return [Artwork(1, kind, 2, "作者", [], kind, 1, 0)]
+            return SearchPage([Novel(3, "小说", 2, "作者", [], 0)], page, False)
+        return SearchPage([Artwork(1, kind, 2, "作者", [], kind, 1, 0)], page, False)
 
     async def forward(bot, event, packet):
         """记录搜索合并转发的分类名称
@@ -124,7 +125,8 @@ def test_aggregate_search_sends_three_separate_forward_records(monkeypatch) -> N
 
     monkeypatch.setattr(commands, "_search_kind", search_kind)
     monkeypatch.setattr(commands, "send_forward", forward)
-    asyncio.run(commands._run_search(FakeBot(), object(), "all", "初音"))
+    event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
+    asyncio.run(commands._run_search(FakeBot(), event, "all", "初音"))
     assert actions == [
         ("message", "正在搜索"),
         ("recall", 77),

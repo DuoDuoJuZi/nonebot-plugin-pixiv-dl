@@ -8,7 +8,7 @@ import httpcore
 import httpx
 
 from .config import Config
-from .models import Artwork, Novel, NovelSeries
+from .models import Artwork, Novel, NovelSeries, SearchPage
 
 PIXIV_HOST = "www.pixiv.net"
 PIXIV_URL = f"https://{PIXIV_HOST}"
@@ -231,7 +231,7 @@ def _search_novel(item: dict) -> Novel:
 
 
 class PixivClient:
-    """复用 HTTPX 客户端完成 Pixiv 数据查询和图片下载"""
+    """复用 HTTPX 客户端完成 Pixiv 分页查询和图片下载"""
 
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """创建共享请求客户端，将 Cookie 限定于 Pixiv 主站并配置统一代理
@@ -319,16 +319,17 @@ class PixivClient:
             raise PixivNotFoundError(f"{path}: empty body")
         return body
 
-    async def _search(self, kind: str, word: str, limit: int) -> list[Artwork] | list[Novel]:
+    async def _search(self, kind: str, word: str, limit: int, page: int = 1) -> SearchPage:
         """分页查询指定分类作品，按配置过滤限制级内容
 
         Args:
             kind: 请求的作品分类
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
+            page: 本批查询起始的 Pixiv 页码，从 1 开始
 
         Returns:
-            按接口顺序排列且不超过数量上限的作品预览
+            按接口顺序排列的限量预览，实际最后读取页码和后续页标记
 
         Raises:
             PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
@@ -336,13 +337,14 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
+        if page < 1 or limit < 1:
+            raise PixivAPIError("搜索页码与结果上限必须大于 0")
         route, key, work_type = {
             "image": ("illustrations", "illust", "illust"),
             "manga": ("manga", "manga", "manga"),
             "novel": ("novels", "novel", None),
         }[kind]
         result: list[Artwork] | list[Novel] = []
-        page = 1
         while len(result) < limit:
             params = {
                 "word": word,
@@ -361,6 +363,16 @@ class PixivClient:
             items = section.get("data")
             if not isinstance(items, list):
                 raise PixivAPIError(f"/ajax/search/{route}: invalid items")
+            try:
+                if section.get("lastPage") is not None:
+                    has_next = page < int(section["lastPage"])
+                elif section.get("total") is not None:
+                    has_next = page * 60 < int(section["total"])
+                else:
+                    has_next = len(items) >= 60
+            except (TypeError, ValueError) as exc:
+                raise PixivAPIError(f"/ajax/search/{route}: 分页信息无效") from exc
+            has_next = bool(items) and has_next
             for item in items:
                 illust_type = item.get("illustType")
                 if kind == "image" and illust_type in (1, 2):
@@ -372,21 +384,21 @@ class PixivClient:
                     result.append(model)
                     if len(result) == limit:
                         break
-            total = int(section.get("total") or 0)
-            if not items or (total and page * 60 >= total) or len(items) < 60:
+            if not has_next or len(result) == limit or len(items) < 60:
                 break
             page += 1
-        return result
+        return SearchPage(result, page, has_next)
 
-    async def search_artworks(self, word: str, limit: int) -> list[Artwork]:
+    async def search_artworks(self, word: str, limit: int, page: int = 1) -> SearchPage:
         """查询插画搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
+            page: 本批查询起始的 Pixiv 页码，从 1 开始
 
         Returns:
-            不超过指定数量的插画元数据列表
+            不超过指定数量的插画元数据，最后读取页码和后续页标记
 
         Raises:
             PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
@@ -394,17 +406,18 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
-        return await self._search("image", word, limit)
+        return await self._search("image", word, limit, page)
 
-    async def search_manga(self, word: str, limit: int) -> list[Artwork]:
+    async def search_manga(self, word: str, limit: int, page: int = 1) -> SearchPage:
         """查询漫画搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
+            page: 本批查询起始的 Pixiv 页码，从 1 开始
 
         Returns:
-            不超过指定数量的漫画元数据列表
+            不超过指定数量的漫画元数据，最后读取页码和后续页标记
 
         Raises:
             PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
@@ -412,17 +425,18 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
-        return await self._search("manga", word, limit)
+        return await self._search("manga", word, limit, page)
 
-    async def search_novels(self, word: str, limit: int) -> list[Novel]:
+    async def search_novels(self, word: str, limit: int, page: int = 1) -> SearchPage:
         """查询小说搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
+            page: 本批查询起始的 Pixiv 页码，从 1 开始
 
         Returns:
-            不超过指定数量的小说元数据列表
+            不超过指定数量的小说元数据，最后读取页码和后续页标记
 
         Raises:
             PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
@@ -430,7 +444,7 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
-        return await self._search("novel", word, limit)
+        return await self._search("novel", word, limit, page)
 
     async def get_illust(self, work_id: int) -> Artwork:
         """查询作品详情并识别插画或漫画类型
