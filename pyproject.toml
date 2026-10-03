@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nonebot-plugin-pixiv-dl"
-version = "0.1.6"
+version = "0.1.7"
 description = "基于 Pixiv Web AJAX 的 NoneBot2 OneBot V11 搜索与下载插件"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,8 @@ dependencies = [
     "httpcore>=1,<2",
     "pydantic>=1.10,<3",
     "Pillow>=10,<13",
+    "imageio-ffmpeg>=0.6,<0.7",
+    "anyio>=3.7,<5",
 ]
 
 [project.urls]

@@ -11,7 +11,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 from PIL import Image, ImageFilter
 
-from .models import Artwork, Novel, NovelSeries
+from .models import Artwork, Novel, NovelSeries, UgoiraMeta
 
 KIND_NAMES = {"image": "图片", "manga": "漫画", "novel": "小说"}
 
@@ -19,7 +19,7 @@ KIND_NAMES = {"image": "图片", "manga": "漫画", "novel": "小说"}
 # @Author: DuoDuoJuZi
 # @Date: 2026-09-29
 def format_artwork(work: Artwork, sent_pages: int | None = None) -> str:
-    """生成用于聊天展示的插画或漫画元数据
+    """生成作品元数据，归入图片的 Ugoira 额外显示动图标记
 
     Args:
         work: 待展示的插画或漫画详情
@@ -29,7 +29,7 @@ def format_artwork(work: Artwork, sent_pages: int | None = None) -> str:
         包含作品基本信息的多行文本，不包含原图地址
     """
     lines = [
-        f"类型：{KIND_NAMES[work.type]}",
+        f"类型：{KIND_NAMES[work.type]}{'（动图）' if work.is_ugoira else ''}",
         f"标题：{work.title}",
         f"PID：{work.id}",
         f"作者：{work.user_name}",
@@ -212,11 +212,47 @@ def build_novel_forward(
         packet = [MessageSegment.node_custom(self_id, "Pixiv 小说", heading)]
         for path in paths[start : start + capacity]:
             content = Message(
-                [MessageSegment("file", {"file": str(path.resolve()), "name": path.name})]
+                [file_segment(path)]
             )
             packet.append(MessageSegment.node_custom(self_id, "Pixiv 小说", content))
         packets.append(packet)
     return packets
+
+
+def file_segment(path: Path) -> MessageSegment:
+    """复用 NapCat 文件扩展表示协议端可访问的本地临时文件
+
+    Args:
+        path: 发送调用结束前必须保持存在的文件路径
+
+    Returns:
+        带有安全文件名和绝对路径的文件消息段
+    """
+    return MessageSegment("file", {"file": str(path.resolve()), "name": path.name})
+
+
+def build_ugoira_forward(
+    work: Artwork, meta: UgoiraMeta, archive_path: Path, self_id: int
+) -> list[MessageSegment]:
+    """复用小说文件转发机制发送动图元数据和原始 ZIP
+
+    Args:
+        work: 已通过限制级检查的动图作品详情
+        meta: 提供帧数和完整动画时长的动图元数据
+        archive_path: 未经修改的原始帧 ZIP 本地路径
+        self_id: 转发节点使用的机器人账号
+
+    Returns:
+        包含元数据与 ZIP 文件的两个合并转发节点
+    """
+    metadata = (
+        f"{format_artwork(work)}\n帧数：{len(meta.frames)}\n"
+        f"动画时长：{sum(frame.delay for frame in meta.frames) / 1000:.3f} 秒"
+    )
+    return [
+        MessageSegment.node_custom(self_id, "Pixiv 图片", metadata),
+        MessageSegment.node_custom(self_id, "Pixiv 图片", Message([file_segment(archive_path)])),
+    ]
 
 
 async def send_forward(bot: Bot, event: MessageEvent, packet: list[MessageSegment]) -> None:

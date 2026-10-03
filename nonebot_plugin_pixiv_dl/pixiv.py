@@ -2,13 +2,23 @@ import html
 import re
 import ssl
 from http.cookies import SimpleCookie
+from pathlib import Path
 from urllib.parse import quote, urlparse
 
+import anyio
 import httpcore
 import httpx
 
 from .config import Config
-from .models import Artwork, Novel, NovelSeries, SearchPage
+from .models import (
+    Artwork,
+    Novel,
+    NovelSeries,
+    SearchPage,
+    UgoiraFrame,
+    UgoiraMeta,
+    validate_cdn_url,
+)
 
 PIXIV_HOST = "www.pixiv.net"
 PIXIV_URL = f"https://{PIXIV_HOST}"
@@ -42,6 +52,10 @@ class PixivNotFoundError(PixivAPIError):
 
 class PixivR18Error(PixivError):
     """表示限制级作品下载被配置拦截"""
+
+
+class PixivResourceError(PixivAPIError):
+    """表示资源超出保护上限，异常文本可直接用于用户提示"""
 
 
 class FixedIPBackend(httpcore.AsyncNetworkBackend):
@@ -185,7 +199,7 @@ def _preview_url(item: dict) -> str | None:
 
 
 def _search_artwork(item: dict, kind: str) -> Artwork:
-    """将搜索结果转换为包含低清预览地址的插画或漫画模型
+    """将搜索结果转换为保留原始分类和低清预览地址的作品模型
 
     Args:
         item: 搜索接口返回的单个作品预览对象
@@ -204,6 +218,7 @@ def _search_artwork(item: dict, kind: str) -> Artwork:
         page_count=int(item.get("pageCount") or 1),
         x_restrict=int(item.get("xRestrict") or 0),
         preview_url=_preview_url(item),
+        illust_type=int(item.get("illustType") or (1 if kind == "manga" else 0)),
     )
 
 
@@ -231,7 +246,7 @@ def _search_novel(item: dict) -> Novel:
 
 
 class PixivClient:
-    """复用 HTTPX 客户端完成 Pixiv 分页查询和图片下载"""
+    """复用 HTTPX 客户端完成 Pixiv 分页查询，图片及动图资源下载"""
 
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """创建共享请求客户端，将 Cookie 限定于 Pixiv 主站并配置统一代理
@@ -340,7 +355,7 @@ class PixivClient:
         if page < 1 or limit < 1:
             raise PixivAPIError("搜索页码与结果上限必须大于 0")
         route, key, work_type = {
-            "image": ("illustrations", "illust", "illust"),
+            "image": ("illustrations", "illust", "illust_and_ugoira"),
             "manga": ("manga", "manga", "manga"),
             "novel": ("novels", "novel", None),
         }[kind]
@@ -375,7 +390,7 @@ class PixivClient:
             has_next = bool(items) and has_next
             for item in items:
                 illust_type = item.get("illustType")
-                if kind == "image" and illust_type in (1, 2):
+                if kind == "image" and illust_type not in (None, 0, 2):
                     continue
                 if kind == "manga" and illust_type not in (None, 1):
                     continue
@@ -390,7 +405,7 @@ class PixivClient:
         return SearchPage(result, page, has_next)
 
     async def search_artworks(self, word: str, limit: int, page: int = 1) -> SearchPage:
-        """查询插画搜索预览
+        """查询包含普通插画和 Ugoira 的图片搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
@@ -398,7 +413,7 @@ class PixivClient:
             page: 本批查询起始的 Pixiv 页码，从 1 开始
 
         Returns:
-            不超过指定数量的插画元数据，最后读取页码和后续页标记
+            不超过指定数量的图片元数据，最后读取页码和后续页标记
 
         Raises:
             PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
@@ -447,7 +462,7 @@ class PixivClient:
         return await self._search("novel", word, limit, page)
 
     async def get_illust(self, work_id: int) -> Artwork:
-        """查询作品详情并识别插画或漫画类型
+        """查询作品详情并保留插画，漫画及 Ugoira 的原始类型
 
         Args:
             work_id: 待查询作品的 Pixiv ID
@@ -459,7 +474,7 @@ class PixivClient:
             PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
             PixivNotFoundError: 请求的资源不存在或响应没有业务数据
             PixivNetworkError: 请求超时或网络连接失败
-            PixivAPIError: 响应结构无效或作品为暂不支持的动图
+            PixivAPIError: 响应结构或作品类型无效
             PixivR18Error: 作品属于限制级内容且配置禁止下载
         """
         path = f"/ajax/illust/{work_id}"
@@ -469,8 +484,8 @@ class PixivClient:
         if "illustType" not in body:
             raise PixivAPIError(f"{path}: missing artwork type")
         illust_type = int(body["illustType"])
-        if illust_type == 2:
-            raise PixivAPIError(f"{path}: animated artworks are unsupported")
+        if illust_type not in (0, 1, 2):
+            raise PixivAPIError(f"{path}: 作品类型无效")
         artwork = Artwork(
             id=int(body.get("illustId") or work_id),
             title=str(body.get("title") or ""),
@@ -481,9 +496,85 @@ class PixivClient:
             page_count=int(body.get("pageCount") or 1),
             x_restrict=int(body.get("xRestrict") or 0),
             description=_description(body.get("description")),
+            illust_type=illust_type,
         )
         self._check_r18(artwork)
         return artwork
+
+    async def get_ugoira_meta(self, work_id: int) -> UgoiraMeta:
+        """查询并严格解析动图的两种 ZIP 地址及逐帧时序
+
+        Args:
+            work_id: 已识别为 Ugoira 的 Pixiv 作品 ID
+
+        Returns:
+            保留原始帧顺序和毫秒延时的动图元数据
+
+        Raises:
+            PixivAPIError: 接口失败或动图元数据无效
+            PixivNetworkError: 请求超时或网络连接失败
+        """
+        path = f"/ajax/illust/{work_id}/ugoira_meta"
+        body = await self._json(path)
+        try:
+            if not isinstance(body, dict) or not isinstance(body.get("frames"), list):
+                raise ValueError("帧列表缺失")
+            if len(body["frames"]) > 10000:
+                raise PixivResourceError("Ugoira 元数据无效，帧数超过 10000 上限")
+            return UgoiraMeta(
+                src=body["src"],
+                original_src=body["originalSrc"],
+                mime_type=body["mime_type"],
+                frames=[UgoiraFrame(item["file"], item["delay"]) for item in body["frames"]],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PixivAPIError(f"{path}: Ugoira 元数据无效，{exc}") from exc
+
+    async def download_ugoira_archive(
+        self, url: str, destination: Path, max_bytes: int = 2 * 1024**3
+    ) -> None:
+        """将可信动图 ZIP 流式写入磁盘，失败或取消时删除未完成文件
+
+        Args:
+            url: 元数据提供的 src 或 originalSrc 资源地址
+            destination: 当前请求独占临时目录内的目标 ZIP 路径
+            max_bytes: 允许写入的最大字节数，正式下载默认允许 2 GiB
+
+        Raises:
+            PixivAPIError: 地址不可信，HTTP 状态错误或资源为空
+            PixivNetworkError: ZIP 请求超时或连接失败
+            PixivResourceError: ZIP 超过大小保护上限
+            OSError: 临时文件无法写入
+        """
+        try:
+            validate_cdn_url(url)
+        except ValueError as exc:
+            raise PixivAPIError("Ugoira ZIP 地址不可信") from exc
+        completed = False
+        try:
+            async with self.http.stream("GET", url, follow_redirects=False) as response:
+                response.raise_for_status()
+                size = 0
+                async with await anyio.open_file(destination, "wb") as output:
+                    async for chunk in response.aiter_bytes(256 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise PixivResourceError(
+                                f"Ugoira ZIP 超过 {max_bytes // 1024**2} MiB 大小上限"
+                            )
+                        await output.write(chunk)
+                if not size:
+                    raise PixivAPIError("Ugoira ZIP 内容为空")
+                completed = True
+        except httpx.TimeoutException as exc:
+            raise PixivNetworkError("Ugoira ZIP 下载超时") from exc
+        except httpx.RequestError as exc:
+            raise PixivNetworkError(f"Ugoira ZIP 下载连接失败，{exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise PixivAPIError(f"Ugoira ZIP HTTP {exc.response.status_code}") from exc
+        finally:
+            if not completed:
+                destination.unlink(missing_ok=True)
 
     async def get_illust_pages(self, work_id: int) -> list[str]:
         """查询插画或漫画的逐页原图地址
@@ -617,9 +708,10 @@ class PixivClient:
             PixivAPIError: 地址不可信或 HTTP 状态和图片内容无效
             PixivNetworkError: 图片请求超时或网络连接失败
         """
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".pximg.net"):
-            raise PixivAPIError("image: untrusted CDN URL")
+        try:
+            validate_cdn_url(url)
+        except ValueError as exc:
+            raise PixivAPIError("image: untrusted CDN URL") from exc
         try:
             response = await self.http.get(url, follow_redirects=False)
             response.raise_for_status()

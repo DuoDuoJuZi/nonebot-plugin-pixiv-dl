@@ -4,24 +4,26 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from nonebot import get_driver, get_plugin_config, logger, on_regex
-from nonebot.adapters.onebot.v11 import Bot, MessageEvent
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment
 
-from . import pagination
+from . import pagination, ugoira
 from .config import Config
 from .message import (
     KIND_NAMES,
     build_artwork_forward,
     build_novel_forward,
     build_search_forward,
+    build_ugoira_forward,
     format_novel,
     format_series,
     process_preview,
+    safe_filename,
     send_forward,
     write_novel_file,
 )
 from .models import Artwork, Novel, SearchPage
 from .pagination import SearchCursor, SearchSession, prune_sessions, session_key, sessions
-from .pixiv import PixivAPIError, PixivClient, PixivNotFoundError, PixivR18Error
+from .pixiv import PixivAPIError, PixivClient, PixivNotFoundError, PixivR18Error, PixivResourceError
 
 SEARCH_RE = re.compile(
     r"^/px搜索(?!(?:图片|漫画|小说)?下一页\s*$)"
@@ -112,7 +114,7 @@ async def _search_kind(kind: str, word: str, page: int) -> SearchPage:
 
 
 async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
-    """有限并发下载搜索预览，单张失败时保留对应作品的元数据
+    """有限并发处理静态与动态预览，动图失败时降级为安全静态预览
 
     Args:
         items: 按搜索顺序排列的插画或漫画元数据
@@ -130,8 +132,24 @@ async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
             item: 包含预览地址与限制级标记的作品元数据
 
         Returns:
-            已处理的 JPEG 内容，地址缺失或处理失败时返回 None
+            已处理的 GIF 或 JPEG 内容，所有预览尝试均失败时返回 None
         """
+        if item.is_ugoira:
+            try:
+                async with ugoira.preview_semaphore:
+                    meta = await client.get_ugoira_meta(item.id)
+                    with TemporaryDirectory(prefix="nonebot-pixiv-preview-") as directory:
+                        path = Path(directory) / "preview.zip"
+                        await client.download_ugoira_archive(
+                            meta.src, path, ugoira.PREVIEW_ARCHIVE_LIMIT
+                        )
+                        return await ugoira.build_preview(
+                            path, meta, item.is_r18,
+                            config.pixiv_ugoira_preview_max_edge,
+                            config.pixiv_ugoira_preview_max_frames,
+                        )
+            except Exception:
+                logger.exception("Pixiv Ugoira GIF 预览失败，作品 ID={}", item.id)
         if not item.preview_url:
             return None
         try:
@@ -400,8 +418,70 @@ async def _get_download_target(kind: str, work_id: int) -> Artwork | Novel:
     return artwork
 
 
+async def _run_ugoira_download(
+    bot: Bot, event: MessageEvent, work: Artwork, status: dict
+) -> None:
+    """先发送原始 ZIP，再转换并发送视频，分别报告两个输出的结果
+
+    Args:
+        bot: 用于发送文件转发和视频的机器人实例
+        event: 触发下载的群聊或私聊事件
+        work: 保留原始类型及限制级标记的动图详情
+        status: 当前正在下载提示的可撤回消息信息
+    """
+    zip_sent = False
+    phase = "原始帧 ZIP 下载"
+    try:
+        if work.is_r18 and not config.pixiv_r18:
+            raise PixivR18Error(f"{work.id}: R18 已关闭")
+        meta = await client.get_ugoira_meta(work.id)
+        with TemporaryDirectory(prefix="nonebot-pixiv-ugoira-") as directory:
+            folder = Path(directory)
+            name = f"{work.id} - {safe_filename(work.title)}"
+            archive = folder / f"{name}.zip"
+            output = folder / f"{name}.mp4"
+            await client.download_ugoira_archive(meta.original_src, archive)
+            await _recall(bot, status)
+            status = None
+            try:
+                await send_forward(
+                    bot, event, build_ugoira_forward(work, meta, archive, int(bot.self_id))
+                )
+                zip_sent = True
+            except Exception:
+                logger.exception("Pixiv Ugoira ZIP 发送失败，作品 ID={}", work.id)
+            phase = "MP4 生成"
+            status = await bot.send(event, "正在生成视频")
+            try:
+                await ugoira.convert_to_mp4(archive, meta, output)
+            except Exception:
+                logger.exception(
+                    "Pixiv Ugoira 转换失败，作品 ID={}，帧数={}，输出={}",
+                    work.id, len(meta.frames), output,
+                )
+                raise
+            await _recall(bot, status)
+            status = None
+            phase = "MP4 视频发送"
+            await bot.send(event, MessageSegment.video(output.resolve()))
+            if not zip_sent:
+                await bot.send(event, "MP4 已发送，但原始帧 ZIP 发送失败")
+    except PixivR18Error:
+        await bot.send(event, "已关闭 R18，无法下载该作品")
+    except Exception as exc:
+        logger.exception("Pixiv Ugoira {}失败，作品 ID={}", phase, work.id)
+        prefix = "原始帧 ZIP 已发送，但 " if zip_sent else ""
+        suffix = f"，{exc}" if isinstance(exc, PixivResourceError) else "，请查看控制台日志"
+        if not zip_sent and phase.startswith("MP4"):
+            prefix = "原始帧 ZIP 发送失败，且 "
+        await bot.send(event, f"{prefix}{phase}失败{suffix}")
+    finally:
+        if status is not None:
+            await _recall(bot, status)
+
+
 async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) -> None:
-    """下载作品并以元数据首节点打包发送，发送结束后清理临时章节文件
+    """按作品类型编排普通下载或动图 ZIP 与视频下载，结束后清理临时文件
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
@@ -413,6 +493,10 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
     recalled = False
     try:
         target = await _get_download_target(kind, work_id)
+        if isinstance(target, Artwork) and target.is_ugoira:
+            recalled = True
+            await _run_ugoira_download(bot, event, target, status)
+            return
         if isinstance(target, Novel):
             with TemporaryDirectory(prefix="nonebot-pixiv-") as directory:
                 folder = Path(directory)
