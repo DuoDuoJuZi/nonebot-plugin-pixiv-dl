@@ -4,21 +4,24 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from nonebot import get_driver, get_plugin_config, logger, on_regex
-from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 
 from . import pagination, ugoira
 from .config import Config
 from .message import (
     KIND_NAMES,
+    MediaSendResult,
     build_artwork_forward,
     build_novel_forward,
     build_search_forward,
-    build_ugoira_forward,
     format_novel,
     format_series,
+    format_ugoira,
+    format_ugoira_delivery,
     process_preview,
-    safe_filename,
     send_forward,
+    send_ugoira_video,
+    send_ugoira_zip,
     write_novel_file,
 )
 from .models import Artwork, Novel, SearchPage
@@ -37,6 +40,7 @@ config = get_plugin_config(Config)
 client = PixivClient(config)
 preview_semaphore = asyncio.Semaphore(config.pixiv_preview_concurrency)
 get_driver().on_shutdown(client.close)
+get_driver().on_shutdown(ugoira.cleanup_pending_directories)
 
 search_matcher = on_regex(SEARCH_RE.pattern, priority=10, block=True)
 next_matcher = on_regex(NEXT_RE.pattern, priority=9, block=True)
@@ -418,66 +422,92 @@ async def _get_download_target(kind: str, work_id: int) -> Artwork | Novel:
     return artwork
 
 
+async def _send_ugoira_notice(bot: Bot, event: MessageEvent, content: str) -> dict | None:
+    """尽力发送动图文本提示，提示失败不改变资源本身的发送结果
+
+    Args:
+        bot: 用于发送作品信息或状态提示的机器人实例
+        event: 决定文本提示接收会话的消息事件
+        content: 当前作品的元数据，处理状态或独立发送结果
+
+    Returns:
+        可供撤回状态提示的消息信息，文本发送失败时返回 None
+    """
+    try:
+        return await bot.send(event, content)
+    except Exception:
+        logger.exception("Pixiv Ugoira 文本提示发送失败")
+        return None
+
+
 async def _run_ugoira_download(
     bot: Bot, event: MessageEvent, work: Artwork, status: dict
 ) -> None:
-    """先发送原始 ZIP，再转换并发送视频，分别报告两个输出的结果
+    """直接上传原始 ZIP 后发送兼容视频，回执超时保留资源并独立报告结果
 
     Args:
-        bot: 用于发送文件转发和视频的机器人实例
+        bot: 用于调用文件上传和视频发送接口的机器人实例
         event: 触发下载的群聊或私聊事件
         work: 保留原始类型及限制级标记的动图详情
         status: 当前正在下载提示的可撤回消息信息
     """
-    zip_sent = False
+    zip_result = None
+    directory = None
+    retain_files = False
     phase = "原始帧 ZIP 下载"
     try:
         if work.is_r18 and not config.pixiv_r18:
             raise PixivR18Error(f"{work.id}: R18 已关闭")
         meta = await client.get_ugoira_meta(work.id)
-        with TemporaryDirectory(prefix="nonebot-pixiv-ugoira-") as directory:
-            folder = Path(directory)
-            name = f"{work.id} - {safe_filename(work.title)}"
-            archive = folder / f"{name}.zip"
-            output = folder / f"{name}.mp4"
-            await client.download_ugoira_archive(meta.original_src, archive)
-            await _recall(bot, status)
-            status = None
-            try:
-                await send_forward(
-                    bot, event, build_ugoira_forward(work, meta, archive, int(bot.self_id))
-                )
-                zip_sent = True
-            except Exception:
-                logger.exception("Pixiv Ugoira ZIP 发送失败，作品 ID={}", work.id)
-            phase = "MP4 生成"
-            status = await bot.send(event, "正在生成视频")
-            try:
-                await ugoira.convert_to_mp4(archive, meta, output)
-            except Exception:
-                logger.exception(
-                    "Pixiv Ugoira 转换失败，作品 ID={}，帧数={}，输出={}",
-                    work.id, len(meta.frames), output,
-                )
-                raise
-            await _recall(bot, status)
-            status = None
-            phase = "MP4 视频发送"
-            await bot.send(event, MessageSegment.video(output.resolve()))
-            if not zip_sent:
-                await bot.send(event, "MP4 已发送，但原始帧 ZIP 发送失败")
-    except PixivR18Error:
-        await bot.send(event, "已关闭 R18，无法下载该作品")
-    except Exception as exc:
-        logger.exception("Pixiv Ugoira {}失败，作品 ID={}", phase, work.id)
-        prefix = "原始帧 ZIP 已发送，但 " if zip_sent else ""
-        suffix = f"，{exc}" if isinstance(exc, PixivResourceError) else "，请查看控制台日志"
-        if not zip_sent and phase.startswith("MP4"):
-            prefix = "原始帧 ZIP 发送失败，且 "
-        await bot.send(event, f"{prefix}{phase}失败{suffix}")
-    finally:
+        directory = TemporaryDirectory(prefix="nonebot-pixiv-ugoira-")
+        folder = Path(directory.name)
+        archive = folder / f"{work.id}_ugoira.zip"
+        output = folder / f"{work.id}_ugoira.mp4"
+        await client.download_ugoira_archive(meta.original_src, archive)
+        await _recall(bot, status)
+        status = None
+        await _send_ugoira_notice(bot, event, format_ugoira(work, meta))
+        retain_files = True
+        zip_result = await send_ugoira_zip(bot, event, archive, work.id)
+        retain_files = zip_result is MediaSendResult.UNKNOWN
+        phase = "MP4 生成"
+        status = await _send_ugoira_notice(bot, event, "正在生成视频")
+        try:
+            await ugoira.convert_to_mp4(archive, meta, output)
+        except Exception:
+            logger.exception(
+                "Pixiv Ugoira 转换失败，作品 ID={}，帧数={}，输出={}",
+                work.id, len(meta.frames), output,
+            )
+            raise
         if status is not None:
             await _recall(bot, status)
+            status = None
+        phase = "MP4 视频发送"
+        retain_files = True
+        video_result = await send_ugoira_video(bot, event, output, work.id)
+        retain_files = MediaSendResult.UNKNOWN in (zip_result, video_result)
+        result_text = format_ugoira_delivery(zip_result, video_result)
+        if result_text:
+            await _send_ugoira_notice(bot, event, result_text)
+    except PixivR18Error:
+        await _send_ugoira_notice(bot, event, "已关闭 R18，无法下载该作品")
+    except Exception as exc:
+        logger.exception("Pixiv Ugoira {}失败，作品 ID={}", phase, work.id)
+        prefix = {
+            MediaSendResult.SUCCESS: "原始帧 ZIP 已发送，但 ",
+            MediaSendResult.FAILED: "原始帧 ZIP 发送失败，且 ",
+            MediaSendResult.UNKNOWN: "原始帧 ZIP 发送结果未确认，请检查聊天记录，",
+        }.get(zip_result, "")
+        suffix = f"，{exc}" if isinstance(exc, PixivResourceError) else "，请查看控制台日志"
+        await _send_ugoira_notice(bot, event, f"{prefix}{phase}失败{suffix}")
+    finally:
+        try:
+            if status is not None:
+                await _recall(bot, status)
+        finally:
+            if directory is not None:
+                await ugoira.release_directory(directory, retain_files)
 
 
 async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) -> None:

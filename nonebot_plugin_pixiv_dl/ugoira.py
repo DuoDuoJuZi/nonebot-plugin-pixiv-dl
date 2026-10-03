@@ -3,12 +3,15 @@ import shutil
 import stat
 import struct
 from collections.abc import Callable
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TypeVar
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from imageio_ffmpeg import get_ffmpeg_exe
+from nonebot import logger
 from PIL import Image, ImageFilter
 
 from .models import UgoiraMeta
@@ -18,6 +21,8 @@ PREVIEW_ARCHIVE_LIMIT = 128 * 1024**2
 FRAME_BYTES_LIMIT = 256 * 1024**2
 EXTRACTED_BYTES_LIMIT = 8 * 1024**3
 CONVERT_TIMEOUT = 600
+MEDIA_FILE_GRACE = 300
+cleanup_tasks: set[asyncio.Task[None]] = set()
 convert_semaphore = asyncio.Semaphore(1)
 preview_semaphore = asyncio.Semaphore(1)
 Result = TypeVar("Result")
@@ -174,37 +179,23 @@ async def build_preview(
 
 
 def _frame_size(path: Path) -> tuple[int, int]:
-    """仅读取帧头校验尺寸及位深，避免视频转换隐式缩放或丢失透明度
+    """仅读取帧头取得尺寸，避免不同尺寸的帧被隐式缩放
 
     Args:
         path: 从 ZIP 安全写出的单帧路径
 
     Returns:
-        适用于无损 RGB 编码的原始宽高
+        JPEG 或 PNG 原始帧的像素宽高
 
     Raises:
-        UgoiraError: 图像不是至多 8 位的不透明 JPEG 或 PNG，或图像头损坏
+        UgoiraError: 图像格式不受支持或图像头损坏
     """
     with path.open("rb") as source:
         signature = source.read(8)
         if signature == b"\x89PNG\r\n\x1a\n":
-            size = None
-            while header := source.read(8):
-                length, kind = struct.unpack(">I4s", header)
-                if kind == b"IHDR":
-                    width, height, depth, color, _, _, _ = struct.unpack(
-                        ">IIBBBBB", source.read(13)
-                    )
-                    if depth > 8 or color not in (0, 2, 3):
-                        raise UgoiraError("PNG 位深或透明通道无法通过 RGB MP4 无损保留")
-                    size = (width, height)
-                    source.seek(4, 1)
-                elif kind == b"tRNS":
-                    raise UgoiraError("PNG 透明通道无法通过 RGB MP4 无损保留")
-                elif kind == b"IDAT" and size:
-                    return size
-                else:
-                    source.seek(length + 4, 1)
+            length, kind, width, height = struct.unpack(">I4sII", source.read(16))
+            if length == 13 and kind == b"IHDR" and width and height:
+                return width, height
         elif signature[:2] == b"\xff\xd8":
             source.seek(2)
             while source.tell() < min(path.stat().st_size, 1024**2):
@@ -215,10 +206,10 @@ def _frame_size(path: Path) -> tuple[int, int]:
                     marker = source.read(1)
                 length = int.from_bytes(source.read(2), "big")
                 if marker in (b"\xc0", b"\xc1", b"\xc2"):
-                    depth, height, width, components = struct.unpack(">BHHB", source.read(6))
-                    if depth != 8 or components not in (1, 3):
-                        raise UgoiraError("JPEG 位深或颜色模式无法通过 RGB MP4 无损保留")
-                    return width, height
+                    _, height, width, _ = struct.unpack(">BHHB", source.read(6))
+                    if width and height:
+                        return width, height
+                    break
                 if length < 2:
                     break
                 source.seek(length - 2, 1)
@@ -226,7 +217,9 @@ def _frame_size(path: Path) -> tuple[int, int]:
 
 
 def prepare_timeline(archive_path: Path, meta: UgoiraMeta, folder: Path) -> Path:
-    """流式提取全部声明帧并生成毫秒精度的 FFmpeg 时间轴
+    """流式提取全部声明帧，按原始延时生成使用合理输入刻度的时间轴
+
+    图像解复用刻度由最短真实延时决定，最长刻度为 40 毫秒，避免短帧时间戳碰撞
 
     Args:
         archive_path: 原封不动保存的 originalSrc ZIP 路径
@@ -244,6 +237,7 @@ def prepare_timeline(archive_path: Path, meta: UgoiraMeta, folder: Path) -> Path
     frames_dir = folder / "frames"
     frames_dir.mkdir()
     lines = ["ffconcat version 1.0"]
+    frame_rate = Fraction(1000, min(40, min(frame.delay for frame in meta.frames)))
     dimensions = None
     try:
         with ZipFile(archive_path) as archive:
@@ -261,11 +255,11 @@ def prepare_timeline(archive_path: Path, meta: UgoiraMeta, folder: Path) -> Path
                 lines.extend(
                     [
                         f"file '{relative}'",
-                        "option framerate 1000",
+                        f"option framerate {frame_rate}",
                         f"duration {frame.delay // 1000}.{frame.delay % 1000:03d}",
                     ]
                 )
-            lines.extend([f"file '{relative}'", "option framerate 1000"])
+            lines.extend([f"file '{relative}'", f"option framerate {frame_rate}"])
     except (BadZipFile, struct.error) as exc:
         raise UgoiraError("Ugoira ZIP 或帧内容无效") from exc
     timeline = folder / "timeline.ffconcat"
@@ -274,7 +268,9 @@ def prepare_timeline(archive_path: Path, meta: UgoiraMeta, folder: Path) -> Path
 
 
 def ffmpeg_arguments(timeline: Path, output: Path, meta: UgoiraMeta) -> list[str]:
-    """生成全尺寸无损 RGB 编码参数，保留每帧时间并显式设置尾帧时长
+    """生成全尺寸兼容 H.264 参数，使用 VFR 并按实际时间基补足尾帧时长
+
+    尾帧包仍需补齐停留时间，仅为尾帧设置 duration，不强制毫秒时间基或高帧率
 
     Args:
         timeline: 按原始顺序列出全部帧的本地时间轴
@@ -306,29 +302,33 @@ def ffmpeg_arguments(timeline: Path, output: Path, meta: UgoiraMeta) -> list[str
         "-map",
         "0:v:0",
         "-an",
-        "-noautoscale",
         "-filter_threads",
         "1",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v",
-        "libx264rgb",
+        "libx264",
         "-crf",
-        "0",
+        "20",
         "-preset",
-        "ultrafast",
+        "veryfast",
         "-threads",
         "1",
         "-pix_fmt",
-        "rgb24",
+        "yuv420p",
+        "-color_range",
+        "tv",
+        "-bf",
+        "0",
         "-fps_mode",
-        "passthrough",
-        "-enc_time_base",
-        "1:1000",
-        "-video_track_timescale",
-        "1000",
+        "vfr",
         "-frames:v",
         str(len(meta.frames)),
         "-bsf:v",
-        f"setts=duration=if(eq(N\\,{len(meta.frames) - 1})\\,{meta.frames[-1].delay}\\,DURATION)",
+        f"setts=duration=if(eq(N\\,{len(meta.frames) - 1})\\,"
+        f"{meta.frames[-1].delay}/1000/TB\\,DURATION)",
+        "-movflags",
+        "+faststart",
         str(output),
     ]
 
@@ -355,10 +355,10 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
 
 
 async def convert_to_mp4(archive_path: Path, meta: UgoiraMeta, output: Path) -> None:
-    """限制整个进程同时只转换一个动图，超时或取消后回收 FFmpeg
+    """串行转换全尺寸兼容视频，超时或取消后回收 FFmpeg
 
     Args:
-        archive_path: 已下载并发送的同一个 originalSrc ZIP 路径
+        archive_path: 已下载并尝试发送的同一个 originalSrc ZIP 路径
         meta: 提供全部原始帧及逐帧延时的动图元数据
         output: 当前独占临时目录中的 MP4 路径
 
@@ -401,3 +401,42 @@ async def convert_to_mp4(archive_path: Path, meta: UgoiraMeta, output: Path) -> 
             raise UgoiraError(f"FFmpeg {reason}，exit={process.returncode}，stderr={error}")
         if not output.is_file() or not output.stat().st_size:
             raise UgoiraError("FFmpeg 输出的 MP4 文件为空")
+
+
+async def _cleanup_later(directory: TemporaryDirectory) -> None:
+    """等待协议端读取宽限期，关闭机器人时也回收暂存目录
+
+    Args:
+        directory: 包含尚未确认发送结果的 ZIP 或 MP4 的临时目录
+    """
+    try:
+        await asyncio.sleep(MEDIA_FILE_GRACE)
+    finally:
+        try:
+            await _run_sync(directory.cleanup)
+        except OSError:
+            logger.exception("Pixiv Ugoira 暂存目录清理失败，目录={}", directory.name)
+
+
+async def release_directory(directory: TemporaryDirectory, defer: bool) -> None:
+    """按发送确认状态立即或延迟清理独占目录
+
+    Args:
+        directory: 当前下载请求拥有的临时目录
+        defer: 是否存在未确认发送的资源，需要保留 300 秒供协议端读取
+    """
+    if defer:
+        task = asyncio.create_task(_cleanup_later(directory))
+        cleanup_tasks.add(task)
+        task.add_done_callback(cleanup_tasks.discard)
+        await asyncio.sleep(0)
+    else:
+        await _run_sync(directory.cleanup)
+
+
+async def cleanup_pending_directories() -> None:
+    """关闭机器人时结束暂存任务并回收其拥有的临时目录"""
+    tasks = list(cleanup_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)

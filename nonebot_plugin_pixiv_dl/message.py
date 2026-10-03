@@ -1,8 +1,15 @@
+import asyncio
 import re
+from collections.abc import Awaitable
+from enum import Enum
 from io import BytesIO
 from pathlib import Path
 
+import httpcore
+import httpx
+from nonebot import logger
 from nonebot.adapters.onebot.v11 import (
+    ActionFailed,
     Bot,
     GroupMessageEvent,
     Message,
@@ -14,6 +21,7 @@ from PIL import Image, ImageFilter
 from .models import Artwork, Novel, NovelSeries, UgoiraMeta
 
 KIND_NAMES = {"image": "图片", "manga": "漫画", "novel": "小说"}
+MEDIA_SEND_TIMEOUT = 180
 
 
 # @Author: DuoDuoJuZi
@@ -231,28 +239,153 @@ def file_segment(path: Path) -> MessageSegment:
     return MessageSegment("file", {"file": str(path.resolve()), "name": path.name})
 
 
-def build_ugoira_forward(
-    work: Artwork, meta: UgoiraMeta, archive_path: Path, self_id: int
-) -> list[MessageSegment]:
-    """复用小说文件转发机制发送动图元数据和原始 ZIP
+def format_ugoira(work: Artwork, meta: UgoiraMeta) -> str:
+    """生成用于普通消息发送的动图元数据
 
     Args:
         work: 已通过限制级检查的动图作品详情
         meta: 提供帧数和完整动画时长的动图元数据
-        archive_path: 未经修改的原始帧 ZIP 本地路径
-        self_id: 转发节点使用的机器人账号
 
     Returns:
-        包含元数据与 ZIP 文件的两个合并转发节点
+        包含作品信息，帧数和完整播放时长的文本
     """
-    metadata = (
+    return (
         f"{format_artwork(work)}\n帧数：{len(meta.frames)}\n"
         f"动画时长：{sum(frame.delay for frame in meta.frames) / 1000:.3f} 秒"
     )
-    return [
-        MessageSegment.node_custom(self_id, "Pixiv 图片", metadata),
-        MessageSegment.node_custom(self_id, "Pixiv 图片", Message([file_segment(archive_path)])),
-    ]
+
+
+class MediaSendResult(Enum):
+    """区分大资源发送成功，明确失败和回执超时未确认"""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+def is_timeout_error(error: BaseException) -> bool:
+    """检查异常链中是否存在发送回执超时，避免循环引用
+
+    Args:
+        error: Adapter 或底层网络库抛出的发送异常
+
+    Returns:
+        异常自身或其原因与上下文中是否包含超时
+    """
+    pending = [error]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(
+            current, (asyncio.TimeoutError, httpx.TimeoutException, httpcore.TimeoutException)
+        ):
+            return True
+        pending.extend(
+            linked for linked in (current.__cause__, current.__context__) if linked is not None
+        )
+    return False
+
+
+async def _send_media(
+    operation: Awaitable[object], work_id: int, label: str
+) -> MediaSendResult:
+    """执行一次大资源发送，将回执超时标记为未确认并记录完整异常
+
+    Args:
+        operation: 已选定群聊或私聊目标的 OneBot 调用
+        work_id: 用于定位发送日志的 Pixiv 作品 ID
+        label: 当前发送资源的展示名称
+
+    Returns:
+        本次调用的三态发送结果，超时不会自动重试
+    """
+    try:
+        response = await operation
+        if isinstance(response, dict) and (
+            response.get("status") == "failed" or response.get("retcode", 0) != 0
+        ):
+            raise ActionFailed(**response)
+        return MediaSendResult.SUCCESS
+    except Exception as exc:
+        unknown = not isinstance(exc, ActionFailed) and is_timeout_error(exc)
+        logger.exception(
+            "Pixiv Ugoira {}{}，作品 ID={}",
+            label,
+            "发送结果未确认" if unknown else "发送失败",
+            work_id,
+        )
+        return MediaSendResult.UNKNOWN if unknown else MediaSendResult.FAILED
+
+
+async def send_ugoira_zip(
+    bot: Bot, event: MessageEvent, path: Path, work_id: int
+) -> MediaSendResult:
+    """使用群聊或私聊文件上传接口直接发送原始 ZIP
+
+    Args:
+        bot: 支持 NapCat 文件上传扩展的机器人实例
+        event: 决定文件接收会话的下载消息事件
+        path: 在协议端处理期间必须保持存在的本地 ZIP
+        work_id: 用于定位资源发送日志的作品 ID
+
+    Returns:
+        原始帧 ZIP 的三态发送结果
+    """
+    params = {"file": str(path.resolve()), "name": path.name, "_timeout": MEDIA_SEND_TIMEOUT}
+    if isinstance(event, GroupMessageEvent):
+        operation = bot.call_api("upload_group_file", group_id=event.group_id, **params)
+    else:
+        operation = bot.call_api("upload_private_file", user_id=event.user_id, **params)
+    return await _send_media(operation, work_id, "原始帧 ZIP")
+
+
+async def send_ugoira_video(
+    bot: Bot, event: MessageEvent, path: Path, work_id: int
+) -> MediaSendResult:
+    """以视频消息发送兼容 MP4 并延长单次 API 回执等待
+
+    Args:
+        bot: 支持 OneBot 视频消息的机器人实例
+        event: 决定视频接收会话的下载消息事件
+        path: 在协议端处理期间必须保持存在的本地 MP4
+        work_id: 用于定位资源发送日志的作品 ID
+
+    Returns:
+        MP4 视频的三态发送结果
+    """
+    return await _send_media(
+        bot.send(event, MessageSegment.video(path.resolve()), _timeout=MEDIA_SEND_TIMEOUT),
+        work_id,
+        "MP4 视频",
+    )
+
+
+def format_ugoira_delivery(zip_result: MediaSendResult, video_result: MediaSendResult) -> str:
+    """根据两个资源的独立发送结果生成准确的部分成功提示
+
+    Args:
+        zip_result: 原始帧 ZIP 的发送结果
+        video_result: 兼容 MP4 的发送结果
+
+    Returns:
+        需要补充发送的结果文本，两个资源均成功时返回空文本
+    """
+    success, failed, unknown = MediaSendResult
+    messages = {
+        (success, success): "",
+        (failed, success): "MP4 已发送，但原始帧 ZIP 发送失败",
+        (unknown, success): "MP4 已发送，原始帧 ZIP 发送结果未确认，请检查聊天记录",
+        (success, failed): "原始帧 ZIP 已发送，但 MP4 视频发送失败，请查看控制台日志",
+        (success, unknown): "原始帧 ZIP 已发送，MP4 发送结果确认超时，请检查聊天记录",
+        (failed, failed): "原始帧 ZIP 和 MP4 视频发送失败，请查看控制台日志",
+        (unknown, unknown): "原始帧 ZIP 和 MP4 发送结果确认超时，请检查聊天记录",
+        (failed, unknown): "原始帧 ZIP 发送失败，MP4 发送结果确认超时，请检查聊天记录",
+        (unknown, failed): "原始帧 ZIP 发送结果未确认，MP4 视频发送失败，请检查聊天记录",
+    }
+    return messages[zip_result, video_result]
 
 
 async def send_forward(bot: Bot, event: MessageEvent, packet: list[MessageSegment]) -> None:

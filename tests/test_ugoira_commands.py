@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageSegment, PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import (
+    ActionFailed,
+    GroupMessageEvent,
+    MessageSegment,
+    PrivateMessageEvent,
+)
 from PIL import Image
 from test_pixiv import ajax
 from test_preview import image_bytes, png, preview_url, run_search
@@ -152,7 +157,14 @@ def make_event(group: bool):
 
 
 @pytest.mark.parametrize("kind,group", [("image", True), ("auto", False)])
-@pytest.mark.parametrize("failure", [None, "convert", "zip_send", "video_send", "r18", "missing"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None, "convert", "missing", "r18", "zip_send", "video_send",
+        "zip_timeout", "video_timeout", "both_send", "both_timeout",
+        "zip_send_video_timeout", "zip_timeout_video_send", "zip_timeout_convert",
+    ],
+)
 def test_download_original_once_and_independent_outputs(
     monkeypatch,
     kind: str,
@@ -164,7 +176,7 @@ def test_download_original_once_and_independent_outputs(
     Args:
         monkeypatch: 替换网络，编码和 OneBot 接口的 pytest 工具
         kind: 图片下载或自动识别入口
-        group: 是否验证群聊文件转发路由
+        group: 是否验证群聊文件上传路由
         failure: 本次注入的发送，编码或限制级拒绝场景
     """
     archive_data, meta = make_archive()
@@ -207,58 +219,73 @@ def test_download_original_once_and_independent_outputs(
         assert archive.resolve() == paths[0].resolve()
         assert output.parent == archive.parent
         paths.append(output)
-        if failure in ("convert", "missing"):
+        assert output.name == "42_ugoira.mp4"
+        if failure in ("convert", "missing", "zip_timeout_convert"):
             raise ugoira.UgoiraError("帧缺失" if failure == "missing" else "模拟编码失败")
-        output.write_bytes(b"lossless-mp4")
+        output.write_bytes(b"compatible-mp4")
 
-    async def api(name, **kwargs):
+    async def api(api_name, **kwargs):
         """在发送期间读取 ZIP 内容并验证真实群私聊路由
 
         Args:
-            name: 实际调用的 OneBot 文件合并转发接口
-            kwargs: 包含目标会话及文件节点的接口参数
+            api_name: 实际调用的 OneBot 文件上传接口
+            kwargs: 包含目标会话，文件路径及回执超时的接口参数
 
         Raises:
-            RuntimeError: 当前场景模拟 ZIP 上传失败
+            ActionFailed: 当前场景模拟 ZIP 明确上传失败
+            ReadTimeout: 当前场景模拟 ZIP 发送结果未确认
         """
         actions.append("zip")
-        assert name == ("send_group_forward_msg" if group else "send_private_forward_msg")
+        assert api_name == ("upload_group_file" if group else "upload_private_file")
         assert kwargs["group_id" if group else "user_id"] == (30 if group else 20)
-        nodes = kwargs["messages"]
-        assert "类型：图片（动图）" in nodes[0].data["content"]
-        segment = nodes[1].data["content"][0]
-        assert segment.type == "file"
-        archive = Path(segment.data["file"])
+        assert kwargs["_timeout"] == 180
+        assert kwargs["name"] == "42_ugoira.zip"
+        assert set(kwargs) == {"group_id" if group else "user_id", "file", "name", "_timeout"}
+        assert any(isinstance(action, str) and "类型：图片（动图）" in action for action in actions)
+        archive = Path(kwargs["file"])
+        assert archive.is_absolute()
+        assert archive.name == "42_ugoira.zip"
         paths.append(archive)
         assert archive.read_bytes() == archive_data
         assert ".." not in archive.name
-        if failure == "zip_send":
-            raise RuntimeError("模拟文件上传失败")
+        if failure in ("zip_send", "both_send", "zip_send_video_timeout"):
+            raise ActionFailed(retcode=1200, status="failed", message="模拟文件上传失败")
+        if failure in (
+            "zip_timeout", "both_timeout", "zip_timeout_video_send", "zip_timeout_convert"
+        ):
+            raise httpx.ReadTimeout("模拟文件回执超时")
 
-    async def send(event, content):
+    async def send(event, content, **kwargs):
         """记录视频消息并确认本地文件在发送期间仍然存在
 
         Args:
             event: 触发下载的真实群聊或私聊事件
             content: 待发送的状态文本或视频消息段
+            kwargs: 仅视频消息使用的 API 回执超时配置
 
         Returns:
             可供状态撤回使用的消息标识
 
         Raises:
-            RuntimeError: 当前场景要求视频上传失败
+            ActionFailed: 当前场景要求视频明确发送失败
+            ReadTimeout: 当前场景要求视频发送结果未确认
         """
         actions.append(content)
         if isinstance(content, MessageSegment):
             assert content.type == "video"
             assert content.data["file"] == paths[-1].resolve().as_uri()
-            assert paths[-1].read_bytes() == b"lossless-mp4"
-            if failure == "video_send":
-                raise RuntimeError("模拟视频发送失败")
+            assert paths[-1].read_bytes() == b"compatible-mp4"
+            assert kwargs == {"_timeout": 180}
+            if failure in ("video_send", "both_send", "zip_timeout_video_send"):
+                raise ActionFailed(retcode=1200, status="failed", message="模拟视频发送失败")
+            if failure in ("video_timeout", "both_timeout", "zip_send_video_timeout"):
+                raise httpx.ReadTimeout("模拟视频回执超时")
+        else:
+            assert not kwargs
         return {"message_id": len(actions)}
 
     async def scenario():
-        """使用真实客户端完成命令编排并检查 R18 提前拦截"""
+        """使用真实客户端检查 R18 拦截，三态结果及超时后的延迟清理"""
         config = Config(
             pixiv_cookie="PHPSESSID=test",
             pixiv_r18=failure != "r18",
@@ -269,15 +296,26 @@ def test_download_original_once_and_independent_outputs(
         monkeypatch.setattr(commands, "config", config)
         monkeypatch.setattr(commands, "client", client)
         monkeypatch.setattr(ugoira, "convert_to_mp4", convert)
+        monkeypatch.setattr(ugoira, "MEDIA_FILE_GRACE", 0.01)
         bot = SimpleNamespace(self_id="10", send=send, call_api=api, delete_msg=AsyncMock())
         try:
             await commands._run_download(bot, make_event(group), kind, 42)
+            if failure and "timeout" in failure:
+                assert paths[0].exists()
+                assert ugoira.cleanup_tasks
+                if failure != "zip_timeout_convert":
+                    assert paths[-1].exists()
+                await asyncio.gather(*list(ugoira.cleanup_tasks))
+            else:
+                assert all(not path.exists() for path in paths)
         finally:
             await client.close()
 
     asyncio.run(scenario())
     assert all(not path.exists() for path in paths)
     assert meta.src not in requests
+    assert actions.count("zip") <= 1
+    assert sum(isinstance(action, MessageSegment) for action in actions) <= 1
     if failure == "r18":
         assert len(requests) == 1
         assert actions[-1] == "已关闭 R18，无法下载该作品"
@@ -287,10 +325,27 @@ def test_download_original_once_and_independent_outputs(
         if failure in ("convert", "missing", "video_send"):
             assert actions[-1].startswith("原始帧 ZIP 已发送，但 MP4")
             assert "下载失败" != actions[-1]
-        elif failure == "zip_send":
-            assert actions[-1] == "MP4 已发送，但原始帧 ZIP 发送失败"
-        else:
+        elif failure is None:
             assert actions[-1].type == "video"
+        else:
+            expected = {
+                "zip_send": "MP4 已发送，但原始帧 ZIP 发送失败",
+                "zip_timeout": "MP4 已发送，原始帧 ZIP 发送结果未确认，请检查聊天记录",
+                "video_timeout": "原始帧 ZIP 已发送，MP4 发送结果确认超时，请检查聊天记录",
+                "both_send": "原始帧 ZIP 和 MP4 视频发送失败，请查看控制台日志",
+                "both_timeout": "原始帧 ZIP 和 MP4 发送结果确认超时，请检查聊天记录",
+                "zip_send_video_timeout": (
+                    "原始帧 ZIP 发送失败，MP4 发送结果确认超时，请检查聊天记录"
+                ),
+                "zip_timeout_video_send": (
+                    "原始帧 ZIP 发送结果未确认，MP4 视频发送失败，请检查聊天记录"
+                ),
+                "zip_timeout_convert": (
+                    "原始帧 ZIP 发送结果未确认，请检查聊天记录，"
+                    "MP4 生成失败，请查看控制台日志"
+                ),
+            }
+            assert actions[-1] == expected[failure]
 
 
 def test_ugoira_preview_concurrency_is_separate_and_bounded(monkeypatch) -> None:

@@ -1,6 +1,9 @@
 import asyncio
+import re
 import subprocess
 import threading
+import time
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -115,7 +118,8 @@ def test_full_timeline_uses_metadata_order_all_frames_and_delays(tmp_path: Path)
     assert "duration 0.040" in timeline
     assert "duration 0.080" in timeline
     assert "duration 0.120" in timeline
-    assert timeline.endswith("file 'frames/000099.png'\noption framerate 1000\n")
+    assert timeline.endswith("file 'frames/000099.png'\noption framerate 25\n")
+    assert "option framerate 1000\n" not in timeline
     assert not (tmp_path.parent / "ignored.txt").exists()
     with ZipFile(archive) as source:
         for index, frame in enumerate(meta.frames):
@@ -150,47 +154,77 @@ def test_zip_rejects_invalid_resources(tmp_path: Path, failure: str, monkeypatch
         ugoira.prepare_timeline(path, meta, tmp_path)
 
 
+def inspect_mp4(path: Path) -> dict:
+    """使用实际 FFmpeg 读取视频流，时间轴和 H.264 能力声明
+
+    Args:
+        path: 已生成并可供探测的 MP4 文件
+
+    Returns:
+        包含包时间基，包时间戳及流说明的探测结果
+    """
+    executable = get_ffmpeg_exe()
+    result = subprocess.run(
+        [executable, "-v", "error", "-i", str(path), "-c", "copy", "-f", "framehash", "-"],
+        capture_output=True,
+        check=True,
+    ).stdout.decode()
+    packets = [line.split(",") for line in result.splitlines() if not line.startswith("#")]
+    time_base = Fraction(re.search(r"#tb 0: (\S+)", result)[1])
+    information = subprocess.run(
+        [
+            executable, "-hide_banner", "-i", str(path), "-c", "copy",
+            "-bsf:v", "trace_headers", "-f", "null", "-",
+        ],
+        capture_output=True,
+        check=True,
+    ).stderr.decode()
+    return {
+        "header": result,
+        "packets": packets,
+        "time_base": time_base,
+        "duration": float((int(packets[-1][2]) + int(packets[-1][3])) * time_base),
+        "information": information,
+        "level": int(re.search(r"level_idc\s+\S+\s+= (\d+)", information)[1]),
+    }
+
+
 @pytest.mark.parametrize("kind", ["PNG", "JPEG"])
-def test_real_ffmpeg_preserves_rgb_dimensions_all_frames_and_exact_timing(
+@pytest.mark.parametrize("size", [(64, 32), (65, 33), (1920, 1080), (1921, 1081)])
+def test_real_ffmpeg_compatible_codec_dimensions_all_frames_and_timing(
     tmp_path: Path,
     kind: str,
+    size: tuple[int, int],
 ) -> None:
-    """实际编解码并逐字节比较 RGB，同时验证奇数尺寸及每帧毫秒时长
+    """实际编解码兼容视频，验证补齐尺寸，完整帧数及接近原作的时间轴
 
     Args:
         tmp_path: 当前测试独占的临时目录
         kind: 原始帧采用的 PNG 或 JPEG 格式
+        size: 包含偶数和奇数高清尺寸的原始帧像素宽高
     """
-    delays = [1, 7, 41, 83, 127]
-    data, meta = make_archive(5, (65, 33), kind, delays)
+    delays = [100, 80, 150]
+    data, meta = make_archive(6, size, kind, delays)
     archive = tmp_path / "original.zip"
     archive.write_bytes(data)
     output = tmp_path / "output.mp4"
+    started = time.perf_counter()
     asyncio.run(ugoira.convert_to_mp4(archive, meta, output))
+    elapsed = time.perf_counter() - started
     executable = get_ffmpeg_exe()
-    probe = subprocess.run(
-        [
-            executable,
-            "-v",
-            "error",
-            "-i",
-            str(output),
-            "-map",
-            "0:v",
-            "-c",
-            "copy",
-            "-f",
-            "framehash",
-            "-",
-        ],
-        capture_output=True,
-        check=True,
-    ).stdout.decode()
-    packets = [line.split(",") for line in probe.splitlines() if not line.startswith("#")]
-    assert "#dimensions 0: 65x33" in probe
-    assert "#tb 0: 1/1000" in probe
-    assert [int(packet[3]) for packet in packets] == delays
-    assert [int(packet[2]) for packet in packets] == [sum(delays[:i]) for i in range(5)]
+    probe = inspect_mp4(output)
+    width, height = ((value + 1) // 2 * 2 for value in size)
+    assert f"#dimensions 0: {width}x{height}" in probe["header"]
+    assert "#codec_id 0: h264" in probe["header"]
+    assert "yuv420p" in probe["information"]
+    assert "1000 fps" not in probe["information"]
+    assert probe["level"] < 61
+    assert len(probe["packets"]) == 6
+    assert abs(probe["duration"] - sum(frame.delay for frame in meta.frames) / 1000) <= 0.041
+    starts = [float(int(packet[2]) * probe["time_base"]) for packet in probe["packets"]]
+    for index, timestamp in enumerate(starts):
+        assert abs(timestamp - sum(frame.delay for frame in meta.frames[:index]) / 1000) <= 0.021
+    assert len({packet[3].strip() for packet in probe["packets"]}) > 1
     decoded = subprocess.run(
         [
             executable,
@@ -209,35 +243,29 @@ def test_real_ffmpeg_preserves_rgb_dimensions_all_frames_and_exact_timing(
         capture_output=True,
         check=True,
     ).stdout
-    original = b"".join(
-        subprocess.run(
-            [
-                executable,
-                "-v",
-                "error",
-                "-i",
-                str(path),
-                "-pix_fmt",
-                "rgb24",
-                "-f",
-                "rawvideo",
-                "-",
-            ],
-            capture_output=True,
-            check=True,
-        ).stdout
-        for path in sorted((tmp_path / "frames").iterdir())
-    )
-    assert len(decoded) == 65 * 33 * 3 * 5
-    assert decoded == original
+    assert len(decoded) == width * height * 3 * 6
     args = ugoira.ffmpeg_arguments(tmp_path / "timeline.ffconcat", output, meta)
-    assert args[args.index("-crf") + 1] == "0"
-    assert args[args.index("-c:v") + 1] == "libx264rgb"
-    assert args[args.index("-pix_fmt") + 1] == "rgb24"
-    assert args[args.index("-preset") + 1] == "ultrafast"
-    assert args[args.index("-frames:v") + 1] == "5"
+    assert args[args.index("-crf") + 1] == "20"
+    assert args[args.index("-c:v") + 1] == "libx264"
+    assert args[args.index("-pix_fmt") + 1] == "yuv420p"
+    assert args[args.index("-preset") + 1] == "veryfast"
+    assert args[args.index("-frames:v") + 1] == "6"
+    assert args[args.index("-fps_mode") + 1] == "vfr"
+    assert args[args.index("-filter_threads") + 1] == "1"
+    assert args[args.index("-movflags") + 1] == "+faststart"
+    assert args[args.index("-vf") + 1] == "pad=ceil(iw/2)*2:ceil(ih/2)*2"
     assert all(args[i + 1] == "1" for i, arg in enumerate(args) if arg == "-threads")
-    assert not any(word in " ".join(args) for word in ("scale=", "thumbnail", "yuv420p", "-r "))
+    assert not any(word in " ".join(args) for word in ("scale=", "thumbnail", "crop=", "-r "))
+    assert not any(
+        arg in args
+        for arg in ("-noautoscale", "-enc_time_base", "-video_track_timescale", "-level")
+    )
+    print(
+        f"样本 {kind}，ZIP {len(data)} 字节，帧数 6，原始尺寸 {size}，"
+        f"MP4 {output.stat().st_size} 字节，转换 {elapsed:.3f} 秒，"
+        f"时长 {probe['duration']:.3f} 秒，"
+        f"H.264 Level {probe['level'] / 10:.1f}"
+    )
 
 
 @pytest.mark.parametrize("failure", ["timeout", "exit", "empty", "unavailable", "cancel"])
@@ -376,22 +404,21 @@ def test_cancelled_worker_finishes_before_releasing_files() -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", ["size", "alpha", "depth", "corrupt"])
-def test_formal_conversion_rejects_silent_quality_changes(
+@pytest.mark.parametrize("failure", ["size", "corrupt"])
+def test_formal_conversion_rejects_resize_and_corrupt_frames(
     tmp_path: Path,
     failure: str,
 ) -> None:
-    """验证不能无损表示的帧或解码损坏不会生成伪完整视频
+    """验证尺寸不一致或损坏的帧不会被隐式缩放或跳过
 
     Args:
         tmp_path: 当前测试独占的临时目录
-        failure: 不一致尺寸，透明通道，高位深或损坏像素数据
+        failure: 不一致尺寸或损坏的像素数据
     """
     data, meta = make_archive(2)
     original = BytesIO(data)
     archive_path = tmp_path / "original.zip"
-    mode = {"alpha": "RGBA", "depth": "I;16"}.get(failure, "RGB")
-    source = Image.new(mode, (66, 33) if failure == "size" else (65, 33))
+    source = Image.new("RGB", (66, 33) if failure == "size" else (65, 33))
     replacement = BytesIO()
     source.save(replacement, format="PNG")
     with ZipFile(original) as archive, ZipFile(archive_path, "w") as target:
@@ -431,7 +458,7 @@ def test_stuck_process_is_killed_and_reaped() -> None:
 
 
 def test_real_single_frame_keeps_its_full_delay(tmp_path: Path) -> None:
-    """验证只有一帧时仍准确保留尾帧时长且不增加重复视频帧
+    """验证单帧保留接近原作的停留时长，且不增加重复视频帧
 
     Args:
         tmp_path: 当前测试独占的临时目录
@@ -441,11 +468,49 @@ def test_real_single_frame_keeps_its_full_delay(tmp_path: Path) -> None:
     archive.write_bytes(data)
     output = tmp_path / "output.mp4"
     asyncio.run(ugoira.convert_to_mp4(archive, meta, output))
-    probe = subprocess.run(
-        [get_ffmpeg_exe(), "-v", "error", "-i", str(output), "-c", "copy", "-f", "framehash", "-"],
-        capture_output=True,
-        check=True,
-    ).stdout.decode()
-    packets = [line.split(",") for line in probe.splitlines() if not line.startswith("#")]
-    assert len(packets) == 1
-    assert int(packets[0][3]) == 137
+    probe = inspect_mp4(output)
+    assert len(probe["packets"]) == 1
+    assert abs(probe["duration"] - 0.137) <= 0.021
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "I;16"])
+def test_compatible_conversion_accepts_alpha_and_high_depth(tmp_path: Path, mode: str) -> None:
+    """兼容视频允许转换透明或高位深源帧，原始内容仍保存在 ZIP
+
+    Args:
+        tmp_path: 当前测试独占的临时目录
+        mode: 需要验证的原始 PNG 像素模式
+    """
+    _, meta = make_archive(2, delays=[100, 80])
+    path = tmp_path / "original.zip"
+    with ZipFile(path, "w") as archive:
+        for index, frame in enumerate(meta.frames):
+            image = Image.new(
+                mode, (65, 33), (index * 100, 0, 255, 128) if mode == "RGBA" else 1000
+            )
+            encoded = BytesIO()
+            image.save(encoded, format="PNG")
+            archive.writestr(frame.file, encoded.getvalue())
+    original = path.read_bytes()
+    output = tmp_path / "output.mp4"
+    asyncio.run(ugoira.convert_to_mp4(path, meta, output))
+    assert path.read_bytes() == original
+    assert len(inspect_mp4(output)["packets"]) == 2
+
+
+@pytest.mark.parametrize("delays", [[40, 80, 120], [1, 7, 41, 83, 127]])
+def test_real_conversion_keeps_one_hundred_frames(tmp_path: Path, delays: list[int]) -> None:
+    """实际编码保留全部 100 帧，短延时帧也不会因时间量化被丢弃
+
+    Args:
+        tmp_path: 当前测试独占的临时目录
+        delays: 用于验证普通间隔或真实短间隔的毫秒延时序列
+    """
+    data, meta = make_archive(100, (64, 32), delays=delays)
+    path = tmp_path / "original.zip"
+    path.write_bytes(data)
+    output = tmp_path / "output.mp4"
+    asyncio.run(ugoira.convert_to_mp4(path, meta, output))
+    probe = inspect_mp4(output)
+    assert len(probe["packets"]) == 100
+    assert abs(probe["duration"] - sum(frame.delay for frame in meta.frames) / 1000) <= 0.041
