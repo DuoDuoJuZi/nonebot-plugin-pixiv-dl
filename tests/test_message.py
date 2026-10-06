@@ -33,22 +33,29 @@ def novel(novel_id: int = 1) -> Novel:
 
 
 def test_search_forward_has_one_metadata_node_per_result_and_splits() -> None:
-    """验证搜索结果仅展示元数据并使用独立的分类标签"""
+    """验证搜索节点跨分包连续编号且普通下载元数据不带编号"""
     images = [
         Artwork(index, str(index), 2, "作者", [], "image", 1, 0)
         for index in range(1, 6)
     ]
-    packets = message.build_search_forward(images, "image", 2, 10)
+    packets = message.build_search_forward(images, "image", 2, 10, start_index=12)
     assert [len(packet) for packet in packets] == [2, 2, 1]
     assert all(node.type == "node" for packet in packets for node in packet)
     assert "PID：1" in packets[0][0].data["content"]
     assert "https://" not in packets[0][0].data["content"]
     assert all(node.data["nickname"] == "Pixiv 图片" for packet in packets for node in packet)
+    assert [node.data["content"].splitlines()[0] for packet in packets for node in packet] == [
+        f"[{index}]" for index in range(12, 17)
+    ]
 
     novel_packets = message.build_search_forward([novel()], "novel", 2, 10)
-    manga_packets = message.build_search_forward([artwork()], "manga", 2, 10)
+    manga_packets = message.build_search_forward([artwork()], "manga", 2, 10, {1: b"preview"})
     assert novel_packets[0][0].data["nickname"] == "Pixiv 小说"
     assert manga_packets[0][0].data["nickname"] == "Pixiv 漫画"
+    assert novel_packets[0][0].data["content"].startswith("[1]\n类型：小说")
+    assert manga_packets[0][0].data["content"][0].data["text"].startswith("[1]\n类型：漫画")
+    assert message.format_artwork(artwork()).startswith("类型：漫画")
+    assert message.format_novel(novel()).startswith("类型：小说")
 
 
 @pytest.mark.parametrize("work_type", ["image", "manga"])

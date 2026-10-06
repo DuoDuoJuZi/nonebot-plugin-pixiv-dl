@@ -25,7 +25,14 @@ from .message import (
     write_novel_file,
 )
 from .models import Artwork, Novel, SearchPage
-from .pagination import SearchCursor, SearchSession, prune_sessions, session_key, sessions
+from .pagination import (
+    SearchCursor,
+    SearchResultRef,
+    SearchSession,
+    prune_sessions,
+    session_key,
+    sessions,
+)
 from .pixiv import PixivAPIError, PixivClient, PixivNotFoundError, PixivR18Error, PixivResourceError
 
 SEARCH_RE = re.compile(
@@ -34,6 +41,7 @@ SEARCH_RE = re.compile(
 )
 NEXT_RE = re.compile(r"^/px搜索(图片|漫画|小说)?下一页\s*$")
 DOWNLOAD_RE = re.compile(r"^/px下载(图片|漫画|小说)?\s*(\d+)\s*$")
+RESULT_DOWNLOAD_RE = re.compile(r"^/px下载结果\s*(0*[1-9][0-9]*)\s*$")
 KINDS = {"图片": "image", "漫画": "manga", "小说": "novel"}
 
 config = get_plugin_config(Config)
@@ -45,6 +53,7 @@ get_driver().on_shutdown(ugoira.cleanup_pending_directories)
 search_matcher = on_regex(SEARCH_RE.pattern, priority=10, block=True)
 next_matcher = on_regex(NEXT_RE.pattern, priority=9, block=True)
 download_matcher = on_regex(DOWNLOAD_RE.pattern, priority=10, block=True)
+result_download_matcher = on_regex(RESULT_DOWNLOAD_RE.pattern, priority=10, block=True)
 
 
 # @Author: DuoDuoJuZi
@@ -207,7 +216,7 @@ async def _search_and_send(
     targets: dict[str, int],
     selected: str | None = None,
 ) -> None:
-    """共用搜索与预览发送流程，仅推进成功解析的分类游标
+    """共用搜索与预览发送流程，推进解析成功的游标并按发送成功的分包登记编号
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
@@ -282,11 +291,21 @@ async def _search_and_send(
                         config.pixiv_forward_max_messages,
                         int(bot.self_id),
                         previews,
+                        start_index=session.next_result_index,
                     )
+                    offset = 0
                     for packet in packets:
                         if sessions.get(key) is not session:
                             return
                         await send_forward(bot, event, packet)
+                        if sessions.get(key) is not session:
+                            return
+                        for item in result.items[offset : offset + len(packet)]:
+                            session.results[session.next_result_index] = SearchResultRef(
+                                current, item.id
+                            )
+                            session.next_result_index += 1
+                        offset += len(packet)
                 except Exception as exc:
                     logger.error(
                         "Pixiv 搜索结果发送失败，关键词={}，分类={}，当前页={}，目标页={}，"
@@ -390,6 +409,36 @@ async def _run_next(bot: Bot, event: MessageEvent, selected: str | None = None) 
             await bot.send(event, f"{label}已经没有下一页，请重新搜索")
             return
         await _search_and_send(bot, event, session, targets, selected)
+
+
+async def _run_download_result(bot: Bot, event: MessageEvent, index: int) -> None:
+    """持锁读取当前搜索编号，释放锁后复用作品下载流程
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 触发命令的消息事件，决定用户与聊天环境
+        index: 用户选择的当前搜索会话内的正整数编号
+    """
+    key = session_key(bot, event)
+    session = sessions.get(key)
+    prune_sessions()
+    if session is None:
+        await bot.send(event, "没有可用的搜索结果，请先进行搜索")
+        return
+    async with session.lock:
+        if session.expired():
+            if sessions.get(key) is session:
+                del sessions[key]
+            await bot.send(event, "搜索记录已超时，请重新搜索")
+            return
+        if sessions.get(key) is not session:
+            await bot.send(event, "搜索记录已更新，请重新选择结果")
+            return
+        result = session.results.get(index)
+        if result is None:
+            await bot.send(event, f"当前搜索记录中没有结果 {index}")
+            return
+    await _run_download(bot, event, result.kind, result.work_id)
 
 
 async def _get_download_target(kind: str, work_id: int) -> Artwork | Novel:
@@ -611,6 +660,19 @@ async def handle_download(bot: Bot, event: MessageEvent) -> None:
     parsed = parse_download(event.get_plaintext())
     if parsed:
         await _run_download(bot, event, *parsed)
+
+
+@result_download_matcher.handle()
+async def handle_download_result(bot: Bot, event: MessageEvent) -> None:
+    """解析搜索结果下载命令，仅接受正整数编号
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 包含用户所选搜索编号的 OneBot 消息事件
+    """
+    match = RESULT_DOWNLOAD_RE.fullmatch(event.get_plaintext())
+    if match:
+        await _run_download_result(bot, event, int(match.group(1)))
 
 
 @next_matcher.handle()

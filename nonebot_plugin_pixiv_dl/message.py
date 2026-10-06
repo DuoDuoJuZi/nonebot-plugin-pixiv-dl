@@ -137,8 +137,9 @@ def build_search_forward(
     max_messages: int,
     self_id: int,
     previews: dict[int, bytes] | None = None,
+    start_index: int = 1,
 ) -> list[list[MessageSegment]]:
-    """按结果数量拆分搜索转发，每个作品节点包含元数据和可用的预览
+    """按结果数量拆分搜索转发，每个作品节点包含连续编号，元数据和可用的预览
 
     Args:
         items: 按搜索结果顺序排列的同分类作品元数据
@@ -146,6 +147,7 @@ def build_search_forward(
         max_messages: 每个合并转发允许的最大节点数，至少为 1
         self_id: 合并转发节点使用的机器人 QQ 号
         previews: 按作品 ID 保存的已处理预览内容，空值表示仅展示元数据
+        start_index: 本批首个结果在当前搜索会话中的编号
 
     Returns:
         按结果顺序排列的合并转发分包列表
@@ -153,8 +155,9 @@ def build_search_forward(
     packets = []
     for start in range(0, len(items), max_messages):
         packet = []
-        for item in items[start : start + max_messages]:
+        for index, item in enumerate(items[start : start + max_messages], start_index + start):
             content = format_novel(item) if isinstance(item, Novel) else format_artwork(item)
+            content = f"[{index}]\n{content}"
             if isinstance(item, Artwork) and previews and item.id in previews:
                 content = Message(
                     [MessageSegment.text(content), MessageSegment.image(previews[item.id])]

@@ -15,15 +15,25 @@ class SearchCursor:
     has_next: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class SearchResultRef:
+    """保存已发送搜索结果的作品分类和 Pixiv ID"""
+
+    kind: str
+    work_id: int
+
+
 @dataclass(slots=True)
 class SearchSession:
-    """保存搜索意图及独立分类游标，首次成功后固定存活 120 秒"""
+    """保存搜索意图，分类游标及已发送结果引用，首次成功后固定存活 120 秒"""
 
     word: str
     kind: str
     cursors: dict[str, SearchCursor]
     expires_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    results: dict[int, SearchResultRef] = field(default_factory=dict)
+    next_result_index: int = 1
 
     def expired(self) -> bool:
         """判断已建立的分页记录是否达到固定失效时间

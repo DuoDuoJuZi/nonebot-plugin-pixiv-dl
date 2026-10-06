@@ -15,10 +15,10 @@ from nonebot_plugin_pixiv_dl.pixiv import PixivClient, PixivNetworkError
 # @Author: DuoDuoJuZi
 # @Date: 2026-10-02
 class SearchHarness:
-    """通过真实命令处理器验证分页状态，使用模拟时钟与可控搜索结果"""
+    """通过真实命令处理器验证分页与编号下载，使用模拟时钟与可控搜索结果"""
 
     def __init__(self, monkeypatch) -> None:
-        """隔离查询与消息接口并安装可直接推进的时钟
+        """隔离查询，下载与消息接口并安装可直接推进的时钟
 
         Args:
             monkeypatch: 临时替换客户端和时钟的 pytest 工具
@@ -31,9 +31,11 @@ class SearchHarness:
         self.send = AsyncMock(return_value={"message_id": 77})
         self.recall = AsyncMock()
         self.forward = AsyncMock()
+        self.download = AsyncMock()
         monkeypatch.setattr(pagination, "monotonic", lambda: self.now)
         monkeypatch.setattr(commands, "_search_kind", self.search)
         monkeypatch.setattr(commands, "send_forward", self.forward)
+        monkeypatch.setattr(commands, "_run_download", self.download)
         monkeypatch.setattr(commands.config, "pixiv_search_preview", False)
 
     async def search(self, kind: str, word: str, page: int) -> SearchPage:
@@ -68,7 +70,7 @@ class SearchHarness:
     async def run(
         self, text: str, user: int = 1, group: int | None = 100, bot_id: str = "10"
     ) -> None:
-        """构造真实 OneBot 事件并交给当前命令处理器
+        """构造真实 OneBot 事件并交给搜索，分页或编号下载处理器
 
         Args:
             text: 包含命令和可选关键词的用户消息
@@ -93,9 +95,12 @@ class SearchHarness:
             GroupMessageEvent(**fields, group_id=group) if group else PrivateMessageEvent(**fields)
         )
         bot = SimpleNamespace(self_id=bot_id, send=self.send, delete_msg=self.recall)
-        handler = (
-            commands.handle_next if commands.NEXT_RE.fullmatch(text) else commands.handle_search
-        )
+        if commands.RESULT_DOWNLOAD_RE.fullmatch(text):
+            handler = commands.handle_download_result
+        elif commands.NEXT_RE.fullmatch(text):
+            handler = commands.handle_next
+        else:
+            handler = commands.handle_search
         await handler(bot, event)
 
     def session(self, user: int = 1, group: int | None = 100, bot_id: str = "10"):
@@ -157,7 +162,7 @@ def test_next_commands_do_not_match_search(kind: str) -> None:
     [("图片", "/px搜索下一页"), ("小说", "/px搜索小说下一页"), ("漫画", "/px搜索漫画下一页")],
 )
 def test_single_category_pages(harness, kind: str, next_command: str) -> None:
-    """验证单分类通用或显式翻页依次请求第 2 页与第 3 页
+    """验证单分类连续翻页保留旧编号并复用下载入口
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -166,16 +171,100 @@ def test_single_category_pages(harness, kind: str, next_command: str) -> None:
     """
 
     async def scenario():
-        """执行同一分类的首次搜索与连续翻页"""
+        """执行同一分类的连续翻页后下载第一页和第三页结果"""
         await harness.run(f"/px搜索{kind} 关键词")
         await harness.run(next_command)
         await harness.run("/px搜索下一页")
+        await harness.run("/px下载结果 1")
+        await harness.run("/px下载结果3")
 
     asyncio.run(scenario())
     assert harness.calls == [(commands.KINDS[kind], "关键词", page) for page in (1, 2, 3)]
     assert "第 3 页" in harness.last_message()
     assert harness.recall.await_count == 3
     assert harness.forward.await_count == 3
+    assert harness.session().results == {
+        index: pagination.SearchResultRef(commands.KINDS[kind], index) for index in (1, 2, 3)
+    }
+    assert harness.session().next_result_index == 4
+    assert [call.args[2:] for call in harness.download.await_args_list] == [
+        (commands.KINDS[kind], 1),
+        (commands.KINDS[kind], 3),
+    ]
+    assert [
+        call.args[2][0].data["content"].splitlines()[0]
+        for call in harness.forward.await_args_list
+    ] == ["[1]", "[2]", "[3]"]
+
+
+def test_result_numbers_commit_only_sent_packets(harness, monkeypatch) -> None:
+    """验证部分分包失败和空分类不占用编号，已发送结果下载时不持有会话锁
+
+    Args:
+        harness: 记录请求与状态的命令测试环境
+        monkeypatch: 用于提供多分包搜索结果的 pytest 工具
+    """
+    items = [Artwork(index, "画作", 2, "作者", [], "image", 1, 0) for index in range(10, 15)]
+    monkeypatch.setattr(commands.config, "pixiv_forward_max_messages", 2)
+    monkeypatch.setattr(
+        commands, "_search_kind", AsyncMock(side_effect=[
+            SearchPage(items, 1, True),
+            SearchPage([], 1, False),
+            SearchPage([Novel(30, "小说", 2, "作者", [], 0)], 1, False),
+        ])
+    )
+
+    async def forward(bot, event, packet):
+        """在发送完成前检查尚未登记编号，并模拟第二个分包发送失败
+
+        Args:
+            bot: 用于发送当前分包的机器人实例
+            event: 决定搜索会话的消息事件
+            packet: 当前准备发送的搜索节点列表
+
+        Raises:
+            RuntimeError: 第二个分包模拟发送失败
+        """
+        session = harness.session()
+        assert packet[0].data["content"].startswith(f"[{session.next_result_index}]\n")
+        assert len(session.results) == session.next_result_index - 1
+        if harness.forward.await_count == 2:
+            raise RuntimeError("模拟发送失败")
+
+    async def download(bot, event, kind, work_id):
+        """验证下载入口接收到首个结果且搜索会话锁已经释放
+
+        Args:
+            bot: 用于发送下载结果的机器人实例
+            event: 决定下载所在聊天环境的消息事件
+            kind: 编号对应的作品分类
+            work_id: 编号对应的 Pixiv ID
+        """
+        assert not harness.session().lock.locked()
+        assert (kind, work_id) == ("image", 10)
+
+    harness.forward.side_effect = forward
+    harness.download.side_effect = download
+
+    async def scenario():
+        """发送聚合结果后下载已成功发送的编号并拒绝未发送编号"""
+        await harness.run("/px搜索 关键词")
+        assert harness.session().results == {
+            1: pagination.SearchResultRef("image", 10),
+            2: pagination.SearchResultRef("image", 11),
+            3: pagination.SearchResultRef("novel", 30),
+        }
+        assert harness.session().next_result_index == 4
+        await harness.run("/px下载结果 1")
+        await harness.run("/px下载结果 4")
+        assert harness.last_message() == "当前搜索记录中没有结果 4"
+
+    asyncio.run(scenario())
+    harness.download.assert_awaited_once()
+    assert [
+        call.args[2][0].data["content"].splitlines()[0]
+        for call in harness.forward.await_args_list
+    ] == ["[1]", "[3]", "[3]"]
 
 
 @pytest.mark.parametrize("from_aggregate", [False, True])
@@ -206,7 +295,7 @@ def test_locked_category_cannot_switch(harness, from_aggregate: bool) -> None:
 
 @pytest.mark.parametrize("ended", [False, True])
 def test_aggregate_next_skips_exhausted_categories(harness, ended: bool) -> None:
-    """验证聚合翻页独立推进且跳过已经耗尽的分类
+    """验证聚合翻页跳过耗尽分类并按发送顺序共享连续编号
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -230,6 +319,15 @@ def test_aggregate_next_skips_exhausted_categories(harness, ended: bool) -> None
     ]
     session = harness.session()
     assert session.kind == "all"
+    references = [
+        *(pagination.SearchResultRef(kind, 1) for kind in commands.KINDS.values()),
+        *(pagination.SearchResultRef(kind, 2) for kind in kinds),
+    ]
+    assert session.results == dict(enumerate(references, 1))
+    assert [
+        call.args[2][0].data["content"].splitlines()[0]
+        for call in harness.forward.await_args_list
+    ] == [f"[{index}]" for index in range(1, len(references) + 1)]
     assert {kind: cursor.page for kind, cursor in session.cursors.items()} == {
         "image": 2,
         "manga": 1 if ended else 2,
@@ -245,7 +343,7 @@ def test_aggregate_next_skips_exhausted_categories(harness, ended: bool) -> None
 
 @pytest.mark.parametrize("aggregate_next", [False, True])
 def test_aggregate_selects_novel_from_current_page(harness, aggregate_next: bool) -> None:
-    """验证显式小说分支从当前页继续并永久收窄该会话
+    """验证分类锁定后连续编号且保留全部分类已展示结果的下载入口
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -253,7 +351,7 @@ def test_aggregate_selects_novel_from_current_page(harness, aggregate_next: bool
     """
 
     async def scenario():
-        """从聚合模式选择小说后再执行通用翻页"""
+        """锁定小说并翻页后仍能下载最初三个分类的结果"""
         await harness.run("/px搜索 关键词")
         if aggregate_next:
             await harness.run("/px搜索下一页")
@@ -261,12 +359,20 @@ def test_aggregate_selects_novel_from_current_page(harness, aggregate_next: bool
         assert harness.session().kind == "novel"
         assert list(harness.session().cursors) == ["novel"]
         await harness.run("/px搜索下一页")
+        for index in (1, 2, 3):
+            await harness.run(f"/px下载结果 {index}")
 
     asyncio.run(scenario())
     start = 3 if aggregate_next else 2
     assert harness.calls[-2:] == [("novel", "关键词", start), ("novel", "关键词", start + 1)]
     assert "/px搜索图片下一页" not in harness.last_message()
     assert "/px搜索漫画下一页" not in harness.last_message()
+    assert [call.args[2:] for call in harness.download.await_args_list] == [
+        (kind, 1) for kind in commands.KINDS.values()
+    ]
+    count = 8 if aggregate_next else 5
+    assert list(harness.session().results) == list(range(1, count + 1))
+    assert harness.session().results[count] == pagination.SearchResultRef("novel", start + 1)
 
 
 @pytest.mark.parametrize("failure", ["exhausted", "timeout"])
@@ -303,7 +409,7 @@ def test_unsuccessful_selection_does_not_lock(harness, failure: str) -> None:
     [{"user": 2}, {"group": 200}, {"group": None}, {"bot_id": "20"}],
 )
 def test_search_contexts_are_isolated(harness, context: dict) -> None:
-    """验证用户，群聊，私聊和机器人之间不能共享分页记录
+    """验证用户，群聊，私聊和机器人之间不能共享分页及结果编号
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -311,8 +417,11 @@ def test_search_contexts_are_isolated(harness, context: dict) -> None:
     """
 
     async def scenario():
-        """分别建立两个上下文并确认使用各自的关键词和页码"""
+        """拒绝跨上下文下载并确认搜索使用各自的关键词和页码"""
         await harness.run("/px搜索图片 AAA")
+        await harness.run("/px下载结果1", **context)
+        assert harness.last_message() == "没有可用的搜索结果，请先进行搜索"
+        harness.download.assert_not_awaited()
         await harness.run("/px搜索下一页", **context)
         assert "没有可继续的搜索记录" in harness.last_message()
         assert len(harness.calls) == 1
@@ -345,7 +454,7 @@ def test_missing_session_does_not_search(harness, kind: str) -> None:
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_new_search_replaces_previous_intent(harness, fails: bool) -> None:
-    """验证新搜索立即替换旧意图且失败后不会恢复旧关键词
+    """验证新搜索重置编号且失败后不会恢复旧搜索记录
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -353,11 +462,19 @@ def test_new_search_replaces_previous_intent(harness, fails: bool) -> None:
     """
 
     async def scenario():
-        """建立旧会话后发起新搜索并检查后续翻页"""
+        """为旧会话积累编号后发起新搜索并检查编号重置与后续翻页"""
         await harness.run("/px搜索图片 AAA")
+        await harness.run("/px搜索下一页")
+        assert len(harness.session().results) == 2
         if fails:
             harness.failures[("image", 1)] = PixivNetworkError("模拟超时")
         await harness.run("/px搜索图片 BBB")
+        if not fails:
+            assert harness.session().results == {1: pagination.SearchResultRef("image", 1)}
+            assert harness.session().next_result_index == 2
+            await harness.run("/px下载结果 2")
+            assert harness.last_message() == "当前搜索记录中没有结果 2"
+            harness.download.assert_not_awaited()
         await harness.run("/px搜索下一页")
         if fails:
             assert "没有可继续的搜索记录" in harness.last_message()
@@ -366,7 +483,7 @@ def test_new_search_replaces_previous_intent(harness, fails: bool) -> None:
             assert harness.calls[-1] == ("image", "BBB", 2)
 
     asyncio.run(scenario())
-    assert ("image", "AAA", 2) not in harness.calls
+    assert ("image", "AAA", 3) not in harness.calls
 
 
 @pytest.mark.parametrize("age", [119, 120, 121])
@@ -395,21 +512,24 @@ def test_fixed_session_lifetime(harness, age: int) -> None:
 
 
 def test_next_page_never_renews_expiry(harness) -> None:
-    """验证第 2 页成功后仍从首次成功时计算固定期限
+    """验证翻页和编号下载均不延长首次成功后的 120 秒期限
 
     Args:
         harness: 记录请求与状态的命令测试环境
     """
 
     async def scenario():
-        """在第 60 秒成功翻页后于第 121 秒拒绝再次翻页"""
+        """在第 60 秒成功翻页和下载后于第 120 秒拒绝编号下载"""
         await harness.run("/px搜索图片 关键词")
         expires_at = harness.session().expires_at
         harness.now += 60
         await harness.run("/px搜索下一页")
+        await harness.run("/px下载结果 1")
+        harness.download.assert_awaited_once()
         assert harness.session().expires_at == expires_at
-        harness.now += 61
-        await harness.run("/px搜索下一页")
+        harness.now += 60
+        await harness.run("/px下载结果 1")
+        harness.download.assert_awaited_once()
 
     asyncio.run(scenario())
     assert [page for _, _, page in harness.calls] == [1, 2]
@@ -418,7 +538,7 @@ def test_next_page_never_renews_expiry(harness) -> None:
 
 @pytest.mark.parametrize("aggregate", [False, True])
 def test_failed_page_keeps_cursor_and_partial_success(harness, aggregate: bool) -> None:
-    """验证失败分类重试原目标页且聚合成功分类独立推进
+    """验证失败分类不登记编号且重试原目标页，成功分类独立推进
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -432,6 +552,8 @@ def test_failed_page_keeps_cursor_and_partial_success(harness, aggregate: bool) 
         await harness.run("/px搜索下一页")
         session = harness.session()
         assert session.cursors["manga"].page == 1
+        assert pagination.SearchResultRef("manga", 2) not in session.results.values()
+        assert session.next_result_index == (6 if aggregate else 2)
         if aggregate:
             assert session.cursors["image"].page == session.cursors["novel"].page == 2
             assert harness.forward.await_count == 5
@@ -469,22 +591,24 @@ def test_concurrent_next_requests_are_serial(harness, end_page: int) -> None:
         assert "已经没有下一页" in harness.last_message()
 
 
-def test_waiting_for_lock_checks_expiry_again(harness) -> None:
-    """验证等待同一会话锁期间跨过失效时间不会继续访问网络
+@pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载结果 1"])
+def test_waiting_for_lock_checks_expiry_again(harness, queued_command: str) -> None:
+    """验证翻页或编号下载等待锁后重新检查有效期
 
     Args:
         harness: 记录请求与状态的命令测试环境
+        queued_command: 在翻页持锁期间等待的分页或编号下载命令
     """
 
     async def scenario():
-        """让第 2 页持锁并在第 3 页排队后推进到失效时刻"""
+        """让第 2 页持锁并在命令排队后推进到失效时刻"""
         await harness.run("/px搜索图片 关键词")
         harness.now += 119
         entered, release = asyncio.Event(), asyncio.Event()
         harness.gates[("关键词", "image", 2)] = (entered, release)
         first = asyncio.create_task(harness.run("/px搜索下一页"))
         await entered.wait()
-        second = asyncio.create_task(harness.run("/px搜索下一页"))
+        second = asyncio.create_task(harness.run(queued_command))
         await asyncio.sleep(0)
         harness.now += 2
         release.set()
@@ -493,6 +617,7 @@ def test_waiting_for_lock_checks_expiry_again(harness) -> None:
     asyncio.run(scenario())
     assert [page for _, _, page in harness.calls] == [1, 2]
     assert "已超时" in harness.last_message()
+    harness.download.assert_not_awaited()
 
 
 def test_slow_old_search_cannot_overwrite_new_search(harness) -> None:
@@ -634,11 +759,13 @@ def test_expiry_starts_after_initial_search_success(harness) -> None:
     assert [page for _, _, page in harness.calls] == [1, 2]
 
 
-def test_queued_request_cannot_use_replaced_session(harness) -> None:
-    """验证旧会话上排队的翻页不能覆盖新会话或继续旧关键词
+@pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载结果 1"])
+def test_queued_request_cannot_use_replaced_session(harness, queued_command: str) -> None:
+    """验证排队中的分页或编号下载不能使用已被替换的搜索记录
 
     Args:
         harness: 记录请求与状态的命令测试环境
+        queued_command: 等待旧会话锁的分页或编号下载命令
     """
 
     async def scenario():
@@ -648,12 +775,13 @@ def test_queued_request_cannot_use_replaced_session(harness) -> None:
         harness.gates[("AAA", "image", 2)] = (entered, release)
         first = asyncio.create_task(harness.run("/px搜索下一页"))
         await entered.wait()
-        queued = asyncio.create_task(harness.run("/px搜索下一页"))
+        queued = asyncio.create_task(harness.run(queued_command))
         await asyncio.sleep(0)
         await harness.run("/px搜索图片 BBB")
         release.set()
         await asyncio.gather(first, queued)
         assert "已更新" in harness.last_message()
+        harness.download.assert_not_awaited()
         await harness.run("/px搜索下一页")
 
     asyncio.run(scenario())

@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -61,6 +62,41 @@ def test_download_commands(text: str, expected: tuple[str, int] | None) -> None:
         expected: 预期的分类与作品 ID，空值表示样例应被拒绝
     """
     assert commands.parse_download(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/px下载结果 3", 3),
+        ("/px下载结果3", 3),
+        ("/px下载结果 003 ", 3),
+        ("/px下载结果 0", None),
+        ("/px下载结果 -1", None),
+        ("/px下载结果 1.5", None),
+        ("/px下载结果 abc", None),
+        ("/px下载结果", None),
+        ("/px下载结果 3 图片", None),
+    ],
+)
+def test_result_download_commands(monkeypatch, text: str, expected: int | None) -> None:
+    """验证编号下载兼容空格省略且仅接受正整数，不会命中普通 PID 下载
+
+    Args:
+        monkeypatch: 用于替换编号解析后续流程的 pytest 工具
+        text: 包含合法或非法结果编号的命令文本
+        expected: 预期传入查询流程的编号，空值表示拒绝该命令
+    """
+    run = AsyncMock()
+    monkeypatch.setattr(commands, "_run_download_result", run)
+    bot = SimpleNamespace()
+    event = SimpleNamespace(get_plaintext=lambda: text)
+    asyncio.run(commands.handle_download_result(bot, event))
+    assert not commands.DOWNLOAD_RE.fullmatch(text)
+    assert bool(commands.RESULT_DOWNLOAD_RE.fullmatch(text)) == (expected is not None)
+    if expected is None:
+        run.assert_not_awaited()
+    else:
+        run.assert_awaited_once_with(bot, event, expected)
 
 
 def test_aggregate_search_sends_three_separate_forward_records(monkeypatch) -> None:
