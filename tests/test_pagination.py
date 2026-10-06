@@ -70,7 +70,7 @@ class SearchHarness:
     async def run(
         self, text: str, user: int = 1, group: int | None = 100, bot_id: str = "10"
     ) -> None:
-        """构造真实 OneBot 事件并交给搜索，分页或编号下载处理器
+        """构造真实 OneBot 事件并交给搜索，分页，下载或相关查询处理器
 
         Args:
             text: 包含命令和可选关键词的用户消息
@@ -95,8 +95,10 @@ class SearchHarness:
             GroupMessageEvent(**fields, group_id=group) if group else PrivateMessageEvent(**fields)
         )
         bot = SimpleNamespace(self_id=bot_id, send=self.send, delete_msg=self.recall)
-        if commands.RESULT_DOWNLOAD_RE.fullmatch(text):
-            handler = commands.handle_download_result
+        if commands.DOWNLOAD_RE.fullmatch(text):
+            handler = commands.handle_download
+        elif commands.RELATED_RE.fullmatch(text):
+            handler = commands.handle_related
         elif commands.NEXT_RE.fullmatch(text):
             handler = commands.handle_next
         else:
@@ -175,8 +177,8 @@ def test_single_category_pages(harness, kind: str, next_command: str) -> None:
         await harness.run(f"/px搜索{kind} 关键词")
         await harness.run(next_command)
         await harness.run("/px搜索下一页")
-        await harness.run("/px下载结果 1")
-        await harness.run("/px下载结果3")
+        await harness.run("/px下载 1")
+        await harness.run("/px下载3")
 
     asyncio.run(scenario())
     assert harness.calls == [(commands.KINDS[kind], "关键词", page) for page in (1, 2, 3)]
@@ -232,7 +234,7 @@ def test_result_numbers_commit_only_sent_packets(harness, monkeypatch) -> None:
             raise RuntimeError("模拟发送失败")
 
     async def download(bot, event, kind, work_id):
-        """验证下载入口接收到首个结果且搜索会话锁已经释放
+        """验证下载入口使用索引或显式 ID 且搜索会话锁已经释放
 
         Args:
             bot: 用于发送下载结果的机器人实例
@@ -241,13 +243,12 @@ def test_result_numbers_commit_only_sent_packets(harness, monkeypatch) -> None:
             work_id: 编号对应的 Pixiv ID
         """
         assert not harness.session().lock.locked()
-        assert (kind, work_id) == ("image", 10)
 
     harness.forward.side_effect = forward
     harness.download.side_effect = download
 
     async def scenario():
-        """发送聚合结果后下载已成功发送的编号并拒绝未发送编号"""
+        """下载成功发送的编号，缺失编号与显式分类始终按 ID 处理"""
         await harness.run("/px搜索 关键词")
         assert harness.session().results == {
             1: pagination.SearchResultRef("image", 10),
@@ -255,16 +256,111 @@ def test_result_numbers_commit_only_sent_packets(harness, monkeypatch) -> None:
             3: pagination.SearchResultRef("novel", 30),
         }
         assert harness.session().next_result_index == 4
-        await harness.run("/px下载结果 1")
-        await harness.run("/px下载结果 4")
-        assert harness.last_message() == "当前搜索记录中没有结果 4"
+        sent = harness.send.await_count
+        await harness.run("/px下载 1")
+        await harness.run("/px下载 4")
+        for name in commands.KINDS:
+            await harness.run(f"/px下载{name} 1")
+        assert harness.send.await_count == sent
 
     asyncio.run(scenario())
-    harness.download.assert_awaited_once()
+    assert [call.args[2:] for call in harness.download.await_args_list] == [
+        ("image", 10), ("auto", 4), ("image", 1), ("manga", 1), ("novel", 1)
+    ]
     assert [
         call.args[2][0].data["content"].splitlines()[0]
         for call in harness.forward.await_args_list
     ] == ["[1]", "[3]", "[3]"]
+
+
+def test_related_results_replace_context_and_can_be_followed(harness, monkeypatch) -> None:
+    """验证索引相关查询不重复识别类型，新结果可连续查询与下载且从 1 编号
+
+    Args:
+        harness: 记录请求与状态的命令测试环境
+        monkeypatch: 替换相关查询与类型识别接口的 pytest 工具
+    """
+    items = [
+        Artwork(21, "图片", 2, "作者", [], "image", 1, 0),
+        Artwork(22, "漫画", 2, "作者", [], "manga", 1, 0),
+    ]
+    novel = Novel(31, "小说", 2, "作者", [], 0)
+    related = AsyncMock(side_effect=[items, items[:1], [novel]])
+    target = AsyncMock(return_value=novel)
+    monkeypatch.setattr(commands.client, "get_related", related)
+    monkeypatch.setattr(commands, "_get_download_target", target)
+
+    async def scenario():
+        """从搜索索引连续查询相关作品，再使用未命中索引的小说 ID"""
+        await harness.run("/px搜索漫画 关键词")
+        old = harness.session()
+        harness.now += 10
+        await harness.run("/px相关1")
+        session = harness.session()
+        assert session is not old
+        assert session.results == {
+            1: pagination.SearchResultRef("image", 21),
+            2: pagination.SearchResultRef("manga", 22),
+        }
+        assert session.expires_at == harness.now + 60
+        assert not session.cursors
+        await harness.run("/px下载 2")
+        assert harness.download.call_args.args[2:] == ("manga", 22)
+        await harness.run("/px相关 2")
+        target.assert_not_awaited()
+        await harness.run("/px相关 999")
+        target.assert_awaited_once_with("auto", 999)
+        assert harness.session().results == {1: pagination.SearchResultRef("novel", 31)}
+        assert harness.session().next_result_index == 2
+
+    asyncio.run(scenario())
+    assert [call.args for call in related.await_args_list] == [
+        ("manga", 1, commands.config.pixiv_search_limit),
+        ("manga", 22, commands.config.pixiv_search_limit),
+        ("novel", 999, commands.config.pixiv_search_limit),
+    ]
+    assert all(call.args[1] == "正在搜索" for call in harness.send.await_args_list[2:])
+
+
+@pytest.mark.parametrize("failure", ["request", "empty", "first_packet", "later_packet"])
+def test_related_failure_keeps_last_visible_context(harness, monkeypatch, failure: str) -> None:
+    """验证相关查询失败保留旧会话，部分发送成功时只登记已展示结果
+
+    Args:
+        harness: 记录请求与状态的命令测试环境
+        monkeypatch: 替换相关查询接口及分包上限的 pytest 工具
+        failure: 本次模拟的请求失败，空结果或分包发送失败
+    """
+    items = [Artwork(index, "画作", 2, "作者", [], "image", 1, 0) for index in (20, 21, 22)]
+    related = AsyncMock(return_value=[] if failure == "empty" else items)
+    if failure == "request":
+        related.side_effect = PixivNetworkError("模拟超时")
+    monkeypatch.setattr(commands.client, "get_related", related)
+    monkeypatch.setattr(commands.config, "pixiv_forward_max_messages", 2)
+
+    async def scenario():
+        """在已有搜索记录上发起失败的相关查询并检查保留的会话"""
+        await harness.run("/px搜索图片 关键词")
+        old = harness.session()
+        if failure.endswith("packet"):
+            harness.forward.side_effect = (
+                [None, RuntimeError("模拟发送失败")]
+                if failure == "later_packet" else [RuntimeError("模拟发送失败")]
+            )
+        await harness.run("/px相关 1")
+        if failure == "later_packet":
+            assert harness.session() is not old
+            assert harness.session().results == {
+                1: pagination.SearchResultRef("image", 20),
+                2: pagination.SearchResultRef("image", 21),
+            }
+            assert harness.session().next_result_index == 3
+        else:
+            assert harness.session() is old
+        expected = "没有找到相关作品" if failure == "empty" else "相关作品获取失败"
+        assert harness.last_message() == expected
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("from_aggregate", [False, True])
@@ -360,7 +456,7 @@ def test_aggregate_selects_novel_from_current_page(harness, aggregate_next: bool
         assert list(harness.session().cursors) == ["novel"]
         await harness.run("/px搜索下一页")
         for index in (1, 2, 3):
-            await harness.run(f"/px下载结果 {index}")
+            await harness.run(f"/px下载 {index}")
 
     asyncio.run(scenario())
     start = 3 if aggregate_next else 2
@@ -417,11 +513,12 @@ def test_search_contexts_are_isolated(harness, context: dict) -> None:
     """
 
     async def scenario():
-        """拒绝跨上下文下载并确认搜索使用各自的关键词和页码"""
+        """跨上下文下载静默使用 ID 并确认搜索使用各自的关键词和页码"""
         await harness.run("/px搜索图片 AAA")
-        await harness.run("/px下载结果1", **context)
-        assert harness.last_message() == "没有可用的搜索结果，请先进行搜索"
-        harness.download.assert_not_awaited()
+        sent = harness.send.await_count
+        await harness.run("/px下载1", **context)
+        assert harness.download.call_args.args[2:] == ("auto", 1)
+        assert harness.send.await_count == sent
         await harness.run("/px搜索下一页", **context)
         assert "没有可继续的搜索记录" in harness.last_message()
         assert len(harness.calls) == 1
@@ -472,9 +569,10 @@ def test_new_search_replaces_previous_intent(harness, fails: bool) -> None:
         if not fails:
             assert harness.session().results == {1: pagination.SearchResultRef("image", 1)}
             assert harness.session().next_result_index == 2
-            await harness.run("/px下载结果 2")
-            assert harness.last_message() == "当前搜索记录中没有结果 2"
-            harness.download.assert_not_awaited()
+            sent = harness.send.await_count
+            await harness.run("/px下载 2")
+            assert harness.download.call_args.args[2:] == ("auto", 2)
+            assert harness.send.await_count == sent
         await harness.run("/px搜索下一页")
         if fails:
             assert "没有可继续的搜索记录" in harness.last_message()
@@ -486,9 +584,9 @@ def test_new_search_replaces_previous_intent(harness, fails: bool) -> None:
     assert ("image", "AAA", 3) not in harness.calls
 
 
-@pytest.mark.parametrize("age", [119, 120, 121])
+@pytest.mark.parametrize("age", [59, 60, 61])
 def test_fixed_session_lifetime(harness, age: int) -> None:
-    """验证有效期使用单调时钟且到达 120 秒即停止请求
+    """验证有效期使用单调时钟且到达 60 秒即停止请求
 
     Args:
         harness: 记录请求与状态的命令测试环境
@@ -502,7 +600,7 @@ def test_fixed_session_lifetime(harness, age: int) -> None:
         await harness.run("/px搜索下一页")
 
     asyncio.run(scenario())
-    if age < 120:
+    if age < 60:
         assert harness.calls[-1] == ("image", "关键词", 2)
     else:
         assert len(harness.calls) == 1
@@ -512,28 +610,29 @@ def test_fixed_session_lifetime(harness, age: int) -> None:
 
 
 def test_next_page_never_renews_expiry(harness) -> None:
-    """验证翻页和编号下载均不延长首次成功后的 120 秒期限
+    """验证翻页和编号下载均不延长首次成功后的 60 秒期限
 
     Args:
         harness: 记录请求与状态的命令测试环境
     """
 
     async def scenario():
-        """在第 60 秒成功翻页和下载后于第 120 秒拒绝编号下载"""
+        """在第 30 秒翻页与下载后于第 60 秒静默改按 ID 下载"""
         await harness.run("/px搜索图片 关键词")
         expires_at = harness.session().expires_at
-        harness.now += 60
+        harness.now += 30
         await harness.run("/px搜索下一页")
-        await harness.run("/px下载结果 1")
+        await harness.run("/px下载 1")
         harness.download.assert_awaited_once()
         assert harness.session().expires_at == expires_at
-        harness.now += 60
-        await harness.run("/px下载结果 1")
-        harness.download.assert_awaited_once()
+        harness.now += 30
+        await harness.run("/px下载 1")
+        assert harness.download.call_args.args[2:] == ("auto", 1)
+        assert not pagination.sessions
 
     asyncio.run(scenario())
     assert [page for _, _, page in harness.calls] == [1, 2]
-    assert "已超时" in harness.last_message()
+    assert "已超时" not in harness.last_message()
 
 
 @pytest.mark.parametrize("aggregate", [False, True])
@@ -591,7 +690,7 @@ def test_concurrent_next_requests_are_serial(harness, end_page: int) -> None:
         assert "已经没有下一页" in harness.last_message()
 
 
-@pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载结果 1"])
+@pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载 1"])
 def test_waiting_for_lock_checks_expiry_again(harness, queued_command: str) -> None:
     """验证翻页或编号下载等待锁后重新检查有效期
 
@@ -603,7 +702,7 @@ def test_waiting_for_lock_checks_expiry_again(harness, queued_command: str) -> N
     async def scenario():
         """让第 2 页持锁并在命令排队后推进到失效时刻"""
         await harness.run("/px搜索图片 关键词")
-        harness.now += 119
+        harness.now += 59
         entered, release = asyncio.Event(), asyncio.Event()
         harness.gates[("关键词", "image", 2)] = (entered, release)
         first = asyncio.create_task(harness.run("/px搜索下一页"))
@@ -616,8 +715,12 @@ def test_waiting_for_lock_checks_expiry_again(harness, queued_command: str) -> N
 
     asyncio.run(scenario())
     assert [page for _, _, page in harness.calls] == [1, 2]
-    assert "已超时" in harness.last_message()
-    harness.download.assert_not_awaited()
+    if queued_command == "/px搜索下一页":
+        assert "已超时" in harness.last_message()
+        harness.download.assert_not_awaited()
+    else:
+        assert harness.download.call_args.args[2:] == ("auto", 1)
+        assert "已超时" not in harness.last_message()
 
 
 def test_slow_old_search_cannot_overwrite_new_search(harness) -> None:
@@ -681,7 +784,7 @@ def test_expired_records_are_pruned(harness, operation: str) -> None:
     async def scenario():
         """让旧用户记录过期后由新用户触发清理"""
         await harness.run("/px搜索图片 AAA")
-        harness.now += 121
+        harness.now += 61
         await harness.run("/px搜索图片 BBB" if operation == "search" else "/px搜索下一页", user=2)
 
     asyncio.run(scenario())
@@ -749,17 +852,17 @@ def test_expiry_starts_after_initial_search_success(harness) -> None:
         first = asyncio.create_task(harness.run("/px搜索图片 关键词"))
         await entered.wait()
         assert harness.session().expires_at is None
-        harness.now += 121
+        harness.now += 61
         release.set()
         await first
-        assert harness.session().expires_at == harness.now + 120
+        assert harness.session().expires_at == harness.now + 60
         await harness.run("/px搜索下一页")
 
     asyncio.run(scenario())
     assert [page for _, _, page in harness.calls] == [1, 2]
 
 
-@pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载结果 1"])
+@pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载 1"])
 def test_queued_request_cannot_use_replaced_session(harness, queued_command: str) -> None:
     """验证排队中的分页或编号下载不能使用已被替换的搜索记录
 
@@ -780,8 +883,12 @@ def test_queued_request_cannot_use_replaced_session(harness, queued_command: str
         await harness.run("/px搜索图片 BBB")
         release.set()
         await asyncio.gather(first, queued)
-        assert "已更新" in harness.last_message()
-        harness.download.assert_not_awaited()
+        if queued_command == "/px搜索下一页":
+            assert "已更新" in harness.last_message()
+            harness.download.assert_not_awaited()
+        else:
+            assert harness.download.call_args.args[2:] == ("auto", 1)
+            assert "已更新" not in harness.last_message()
         await harness.run("/px搜索下一页")
 
     asyncio.run(scenario())

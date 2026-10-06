@@ -41,7 +41,7 @@ SEARCH_RE = re.compile(
 )
 NEXT_RE = re.compile(r"^/px搜索(图片|漫画|小说)?下一页\s*$")
 DOWNLOAD_RE = re.compile(r"^/px下载(图片|漫画|小说)?\s*(\d+)\s*$")
-RESULT_DOWNLOAD_RE = re.compile(r"^/px下载结果\s*(0*[1-9][0-9]*)\s*$")
+RELATED_RE = re.compile(r"^/px相关\s*(0*[1-9][0-9]*)\s*$")
 KINDS = {"图片": "image", "漫画": "manga", "小说": "novel"}
 
 config = get_plugin_config(Config)
@@ -53,7 +53,7 @@ get_driver().on_shutdown(ugoira.cleanup_pending_directories)
 search_matcher = on_regex(SEARCH_RE.pattern, priority=10, block=True)
 next_matcher = on_regex(NEXT_RE.pattern, priority=9, block=True)
 download_matcher = on_regex(DOWNLOAD_RE.pattern, priority=10, block=True)
-result_download_matcher = on_regex(RESULT_DOWNLOAD_RE.pattern, priority=10, block=True)
+related_matcher = on_regex(RELATED_RE.pattern, priority=10, block=True)
 
 
 # @Author: DuoDuoJuZi
@@ -74,13 +74,13 @@ def parse_search(text: str) -> tuple[str, str] | None:
 
 
 def parse_download(text: str) -> tuple[str, int] | None:
-    """解析下载命令，保留用户指定的分类或自动识别标记
+    """解析下载命令，保留显式分类或索引优先的自动模式标记
 
     Args:
         text: 用户发送的完整下载命令文本
 
     Returns:
-        下载分类与作品 ID，命令格式不匹配时返回 None
+        下载分类与输入数字，命令格式不匹配时返回 None
     """
     match = DOWNLOAD_RE.fullmatch(text)
     if not match:
@@ -209,6 +209,47 @@ def _pagination_hint(session: SearchSession) -> str:
     )
 
 
+async def _send_result_packets(
+    bot: Bot,
+    event: MessageEvent,
+    session: SearchSession,
+    items: list[Artwork] | list[Novel],
+    previews: dict[int, bytes],
+    previous: SearchSession | None,
+) -> None:
+    """逐包发送并登记结果，首包成功后才替换原会话
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 决定结果所属用户与聊天环境的消息事件
+        session: 当前持锁的目标结果会话
+        items: 按接口原始顺序排列的作品元数据
+        previews: 按作品 ID 保存的可用预览
+        previous: 发送前应保持不变的会话，首次查询时可为空
+    """
+    key = session_key(bot, event)
+    packets = build_search_forward(
+        items, "all", config.pixiv_forward_max_messages, int(bot.self_id), previews,
+        start_index=session.next_result_index,
+    )
+    offset = 0
+    for packet in packets:
+        if sessions.get(key) is not previous:
+            return
+        await send_forward(bot, event, packet)
+        if sessions.get(key) is not previous:
+            return
+        for item in items[offset : offset + len(packet)]:
+            kind = "novel" if isinstance(item, Novel) else item.type
+            session.results[session.next_result_index] = SearchResultRef(kind, item.id)
+            session.next_result_index += 1
+        offset += len(packet)
+        if session.expires_at is None:
+            session.expires_at = pagination.monotonic() + pagination.SEARCH_SESSION_TTL
+        sessions[key] = session
+        previous = session
+
+
 async def _search_and_send(
     bot: Bot,
     event: MessageEvent,
@@ -245,7 +286,7 @@ async def _search_and_send(
         for kind, result in successful.items():
             session.cursors[kind] = SearchCursor(result.page, result.has_next)
         if successful and session.expires_at is None:
-            session.expires_at = pagination.monotonic() + 120
+            session.expires_at = pagination.monotonic() + pagination.SEARCH_SESSION_TTL
         if selected in successful:
             session.kind = selected
             session.cursors = {selected: session.cursors[selected]}
@@ -285,27 +326,9 @@ async def _search_and_send(
                     await bot.send(event, f"没有搜索到相关{KIND_NAMES[current]}")
                     continue
                 try:
-                    packets = build_search_forward(
-                        result.items,
-                        current,
-                        config.pixiv_forward_max_messages,
-                        int(bot.self_id),
-                        previews,
-                        start_index=session.next_result_index,
+                    await _send_result_packets(
+                        bot, event, session, result.items, previews, session
                     )
-                    offset = 0
-                    for packet in packets:
-                        if sessions.get(key) is not session:
-                            return
-                        await send_forward(bot, event, packet)
-                        if sessions.get(key) is not session:
-                            return
-                        for item in result.items[offset : offset + len(packet)]:
-                            session.results[session.next_result_index] = SearchResultRef(
-                                current, item.id
-                            )
-                            session.next_result_index += 1
-                        offset += len(packet)
                 except Exception as exc:
                     logger.error(
                         "Pixiv 搜索结果发送失败，关键词={}，分类={}，当前页={}，目标页={}，"
@@ -411,34 +434,74 @@ async def _run_next(bot: Bot, event: MessageEvent, selected: str | None = None) 
         await _search_and_send(bot, event, session, targets, selected)
 
 
-async def _run_download_result(bot: Bot, event: MessageEvent, index: int) -> None:
-    """持锁读取当前搜索编号，释放锁后复用作品下载流程
+async def resolve_result_reference(
+    bot: Bot, event: MessageEvent, number: int
+) -> SearchResultRef | None:
+    """持锁解析当前有效结果编号，不发送提示或访问 Pixiv
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
         event: 触发命令的消息事件，决定用户与聊天环境
-        index: 用户选择的当前搜索会话内的正整数编号
+        number: 用户输入的结果编号或 Pixiv ID
+
+    Returns:
+        命中的不可变作品引用，无有效编号时返回 None
     """
     key = session_key(bot, event)
     session = sessions.get(key)
     prune_sessions()
     if session is None:
-        await bot.send(event, "没有可用的搜索结果，请先进行搜索")
-        return
+        return None
     async with session.lock:
-        if session.expired():
-            if sessions.get(key) is session:
-                del sessions[key]
-            await bot.send(event, "搜索记录已超时，请重新搜索")
-            return
         if sessions.get(key) is not session:
-            await bot.send(event, "搜索记录已更新，请重新选择结果")
+            return None
+        if session.expired():
+            del sessions[key]
+            return None
+        return session.results.get(number)
+
+
+async def _run_related(bot: Bot, event: MessageEvent, number: int) -> None:
+    """按当前索引或 Pixiv ID 查询相关作品，发送成功后建立新的结果会话
+
+    Args:
+        bot: 用于调用 OneBot 消息接口的机器人实例
+        event: 决定结果所属用户与聊天环境的消息事件
+        number: 优先作为当前有效结果编号的正整数，否则作为 Pixiv ID
+    """
+    reference = await resolve_result_reference(bot, event, number)
+    key = session_key(bot, event)
+    previous = sessions.get(key)
+    work_id = reference.work_id if reference else number
+    status = None
+    try:
+        status = await bot.send(event, "正在搜索")
+        if reference:
+            kind = reference.kind
+        else:
+            work = await _get_download_target("auto", work_id)
+            kind = "novel" if isinstance(work, Novel) else work.type
+        items = await client.get_related(kind, work_id, config.pixiv_search_limit)
+        previews = await _search_previews([item for item in items if isinstance(item, Artwork)])
+        await _recall(bot, status)
+        status = None
+        if sessions.get(key) is not previous:
             return
-        result = session.results.get(index)
-        if result is None:
-            await bot.send(event, f"当前搜索记录中没有结果 {index}")
+        if not items:
+            await bot.send(event, "没有找到相关作品")
             return
-    await _run_download(bot, event, result.kind, result.work_id)
+        session = SearchSession("", "all", {})
+        async with session.lock:
+            await _send_result_packets(bot, event, session, items, previews, previous)
+    except Exception:
+        logger.exception("Pixiv 相关作品获取失败，作品 ID={}", work_id)
+        if status is not None:
+            await _recall(bot, status)
+            status = None
+        await bot.send(event, "相关作品获取失败")
+    finally:
+        if status is not None:
+            await _recall(bot, status)
 
 
 async def _get_download_target(kind: str, work_id: int) -> Artwork | Novel:
@@ -651,7 +714,7 @@ async def handle_search(bot: Bot, event: MessageEvent) -> None:
 
 @download_matcher.handle()
 async def handle_download(bot: Bot, event: MessageEvent) -> None:
-    """解析 OneBot 消息并执行匹配的下载命令
+    """无分类下载优先解析当前索引，显式分类始终按 Pixiv ID 下载
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
@@ -659,20 +722,25 @@ async def handle_download(bot: Bot, event: MessageEvent) -> None:
     """
     parsed = parse_download(event.get_plaintext())
     if parsed:
+        kind, number = parsed
+        if kind == "auto":
+            reference = await resolve_result_reference(bot, event, number)
+            if reference:
+                parsed = reference.kind, reference.work_id
         await _run_download(bot, event, *parsed)
 
 
-@result_download_matcher.handle()
-async def handle_download_result(bot: Bot, event: MessageEvent) -> None:
-    """解析搜索结果下载命令，仅接受正整数编号
+@related_matcher.handle()
+async def handle_related(bot: Bot, event: MessageEvent) -> None:
+    """解析相关作品查询命令，仅接受正整数
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
-        event: 包含用户所选搜索编号的 OneBot 消息事件
+        event: 包含当前结果编号或 Pixiv ID 的 OneBot 消息事件
     """
-    match = RESULT_DOWNLOAD_RE.fullmatch(event.get_plaintext())
+    match = RELATED_RE.fullmatch(event.get_plaintext())
     if match:
-        await _run_download_result(bot, event, int(match.group(1)))
+        await _run_related(bot, event, int(match.group(1)))
 
 
 @next_matcher.handle()

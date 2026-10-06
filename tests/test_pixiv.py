@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from nonebot_plugin_pixiv_dl.config import Config
+from nonebot_plugin_pixiv_dl.models import Novel
 from nonebot_plugin_pixiv_dl.pixiv import (
     FixedIPBackend,
     FixedIPTransport,
@@ -127,6 +128,51 @@ def test_search_categories_empty_results_and_r18_filter() -> None:
     assert all(request.url.params["mode"] == "safe" for request in seen)
     assert all(request.headers["referer"] == "https://www.pixiv.net/" for request in seen)
     assert all("test_cookie" in request.headers["cookie"] for request in seen)
+
+
+def test_related_endpoints_types_limit_and_r18() -> None:
+    """验证相关接口复用模型解析并保留分类顺序，过滤限制级内容且忽略后续页"""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """提供包含占位项及多种作品类型的首批相关推荐
+
+        Args:
+            request: 用于核对插画或小说路径及数量上限的请求
+
+        Returns:
+            包含限制级作品和后续页标识的模拟相关响应
+        """
+        seen.append(request)
+        key = "novels" if "/novel/" in request.url.path else "illusts"
+        return ajax({key: [
+            {}, {"id": 9, "xRestrict": 1},
+            *({"id": 11 + kind, "illustType": kind} for kind in (0, 1, 2)),
+            {"id": 14},
+        ], "nextIds": [100]})
+
+    async def scenario():
+        """查询两类相关接口并切换限制级开关核对结果"""
+        client = make_client(handler, pixiv_r18=False)
+        try:
+            for kind in ("image", "manga", "novel"):
+                items = await client.get_related(kind, 42, 3)
+                assert [item.id for item in items] == [11, 12, 13]
+                if kind == "novel":
+                    assert all(isinstance(item, Novel) for item in items)
+                else:
+                    assert [item.type for item in items] == ["image", "manga", "image"]
+                    assert items[2].is_ugoira
+            client.config.pixiv_r18 = True
+            assert [item.id for item in await client.get_related("image", 42, 3)] == [9, 11, 12]
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert [request.url.path for request in seen] == [
+        f"/ajax/{route}/42/recommend/init" for route in ("illust", "illust", "novel", "illust")
+    ]
+    assert all(request.url.params["limit"] == "3" for request in seen)
 
 
 def test_search_paginates_without_dropping_or_repeating_results() -> None:

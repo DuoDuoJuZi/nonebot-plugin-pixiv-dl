@@ -246,7 +246,7 @@ def _search_novel(item: dict) -> Novel:
 
 
 class PixivClient:
-    """复用 HTTPX 客户端完成 Pixiv 分页查询，图片及动图资源下载"""
+    """复用 HTTPX 客户端完成 Pixiv 搜索与相关查询，图片及动图资源下载"""
 
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """创建共享请求客户端，将 Cookie 限定于 Pixiv 主站并配置统一代理
@@ -460,6 +460,49 @@ class PixivClient:
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
         return await self._search("novel", word, limit, page)
+
+    async def get_related(self, kind: str, work_id: int, limit: int) -> list[Artwork] | list[Novel]:
+        """查询首批相关作品，复用搜索模型解析并过滤限制级内容
+
+        Args:
+            kind: 源作品分类，插画，漫画及动图共用插画相关接口
+            work_id: 用于查找相关作品的 Pixiv ID
+            limit: 本次最多返回的相关作品数量
+
+        Returns:
+            按接口顺序排列的作品预览，不包含后续推荐页
+
+        Raises:
+            PixivAuthError: 未配置 Cookie 或 Pixiv 要求重新登录
+            PixivNotFoundError: 源作品不存在或接口没有业务数据
+            PixivNetworkError: 请求超时或网络连接失败
+            PixivAPIError: 参数不合法或相关作品响应无效
+        """
+        if kind not in ("image", "manga", "novel") or work_id < 1 or limit < 1:
+            raise PixivAPIError("相关作品分类与数量或作品 ID 无效")
+        route, key = ("novel", "novels") if kind == "novel" else ("illust", "illusts")
+        body = await self._json(f"/ajax/{route}/{work_id}/recommend/init", {"limit": limit})
+        if not isinstance(body, dict) or not isinstance(body.get(key), list):
+            raise PixivAPIError("相关作品响应无效")
+        results = []
+        for item in body[key]:
+            if not isinstance(item, dict):
+                raise PixivAPIError("相关作品数据无效")
+            if not item.get("id"):
+                continue
+            try:
+                model = (
+                    _search_novel(item) if kind == "novel" else _search_artwork(
+                        item, "manga" if int(item.get("illustType") or 0) == 1 else "image"
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise PixivAPIError("相关作品字段无效") from exc
+            if self.config.pixiv_r18 or not model.is_r18:
+                results.append(model)
+                if len(results) == limit:
+                    break
+        return results
 
     async def get_illust(self, work_id: int) -> Artwork:
         """查询作品详情并保留插画，漫画及 Ugoira 的原始类型

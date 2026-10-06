@@ -142,8 +142,8 @@ def build_search_forward(
     """按结果数量拆分搜索转发，每个作品节点包含连续编号，元数据和可用的预览
 
     Args:
-        items: 按搜索结果顺序排列的同分类作品元数据
-        kind: 请求的作品分类
+        items: 按结果顺序排列的作品元数据
+        kind: 展示分类，all 表示使用每个作品的实际分类
         max_messages: 每个合并转发允许的最大节点数，至少为 1
         self_id: 合并转发节点使用的机器人 QQ 号
         previews: 按作品 ID 保存的已处理预览内容，空值表示仅展示元数据
@@ -156,6 +156,8 @@ def build_search_forward(
     for start in range(0, len(items), max_messages):
         packet = []
         for index, item in enumerate(items[start : start + max_messages], start_index + start):
+            item_kind = "novel" if isinstance(item, Novel) else item.type
+            label = KIND_NAMES[item_kind if kind == "all" else kind]
             content = format_novel(item) if isinstance(item, Novel) else format_artwork(item)
             content = f"[{index}]\n{content}"
             if isinstance(item, Artwork) and previews and item.id in previews:
@@ -163,7 +165,7 @@ def build_search_forward(
                     [MessageSegment.text(content), MessageSegment.image(previews[item.id])]
                 )
             packet.append(
-                MessageSegment.node_custom(self_id, f"Pixiv {KIND_NAMES[kind]}", content)
+                MessageSegment.node_custom(self_id, f"Pixiv {label}", content)
             )
         packets.append(packet)
     return packets

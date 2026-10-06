@@ -52,6 +52,7 @@ def test_search_commands(text: str, expected: tuple[str, str] | None) -> None:
         ("/px下载小说 123", ("novel", 123)),
         ("/px下载小说123", ("novel", 123)),
         ("/px下载图片 abc", None),
+        ("/px下载结果 3", None),
     ],
 )
 def test_download_commands(text: str, expected: tuple[str, int] | None) -> None:
@@ -67,19 +68,19 @@ def test_download_commands(text: str, expected: tuple[str, int] | None) -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("/px下载结果 3", 3),
-        ("/px下载结果3", 3),
-        ("/px下载结果 003 ", 3),
-        ("/px下载结果 0", None),
-        ("/px下载结果 -1", None),
-        ("/px下载结果 1.5", None),
-        ("/px下载结果 abc", None),
-        ("/px下载结果", None),
-        ("/px下载结果 3 图片", None),
+        ("/px相关 3", 3),
+        ("/px相关3", 3),
+        ("/px相关 003 ", 3),
+        ("/px相关 0", None),
+        ("/px相关 -1", None),
+        ("/px相关 1.5", None),
+        ("/px相关 abc", None),
+        ("/px相关", None),
+        ("/px相关 3 图片", None),
     ],
 )
-def test_result_download_commands(monkeypatch, text: str, expected: int | None) -> None:
-    """验证编号下载兼容空格省略且仅接受正整数，不会命中普通 PID 下载
+def test_related_commands(monkeypatch, text: str, expected: int | None) -> None:
+    """验证相关查询兼容空格省略且仅接受正整数，不会命中下载命令
 
     Args:
         monkeypatch: 用于替换编号解析后续流程的 pytest 工具
@@ -87,12 +88,12 @@ def test_result_download_commands(monkeypatch, text: str, expected: int | None) 
         expected: 预期传入查询流程的编号，空值表示拒绝该命令
     """
     run = AsyncMock()
-    monkeypatch.setattr(commands, "_run_download_result", run)
+    monkeypatch.setattr(commands, "_run_related", run)
     bot = SimpleNamespace()
     event = SimpleNamespace(get_plaintext=lambda: text)
-    asyncio.run(commands.handle_download_result(bot, event))
+    asyncio.run(commands.handle_related(bot, event))
     assert not commands.DOWNLOAD_RE.fullmatch(text)
-    assert bool(commands.RESULT_DOWNLOAD_RE.fullmatch(text)) == (expected is not None)
+    assert bool(commands.RELATED_RE.fullmatch(text)) == (expected is not None)
     if expected is None:
         run.assert_not_awaited()
     else:

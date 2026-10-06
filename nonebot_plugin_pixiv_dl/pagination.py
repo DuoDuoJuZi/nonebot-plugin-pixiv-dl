@@ -4,6 +4,8 @@ from time import monotonic
 
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 
+SEARCH_SESSION_TTL = 60
+
 
 # @Author: DuoDuoJuZi
 # @Date: 2026-10-02
@@ -25,7 +27,7 @@ class SearchResultRef:
 
 @dataclass(slots=True)
 class SearchSession:
-    """保存搜索意图，分类游标及已发送结果引用，首次成功后固定存活 120 秒"""
+    """保存搜索意图，分类游标及已发送结果引用，首次成功后固定存活 60 秒"""
 
     word: str
     kind: str
