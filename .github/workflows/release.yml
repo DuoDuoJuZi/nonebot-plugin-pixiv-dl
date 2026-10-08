@@ -28,7 +28,7 @@ jobs:
       - name: 安装 uv 和 Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          version: "0.11.20"
+          version: "0.12.23"
           python-version: "3.10"
           enable-cache: false
 
@@ -72,7 +72,7 @@ jobs:
       - name: 安装 uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          version: "0.11.20"
+          version: "0.12.23"
           enable-cache: false
 
       - name: 下载构建产物
