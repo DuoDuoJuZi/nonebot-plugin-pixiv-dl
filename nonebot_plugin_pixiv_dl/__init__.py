@@ -1,3 +1,4 @@
+from nonebot import require
 from nonebot.plugin import PluginMetadata
 
 from .config import Config
@@ -14,4 +15,6 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"~onebot.v11"},
 )
 
-from . import commands as commands
+require("nonebot_plugin_localstore")
+
+from . import commands as commands  # noqa: E402

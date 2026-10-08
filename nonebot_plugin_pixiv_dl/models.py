@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 # @Date: 2026-09-29
 @dataclass(slots=True)
 class Artwork:
-    """保存插画，漫画及动图的原始分类，元数据和图片地址"""
+    """保存插画，漫画及动图的分类，内容标记，筛选来源和图片地址"""
 
     id: int
     title: str
@@ -21,6 +21,8 @@ class Artwork:
     urls: list[str] = field(default_factory=list)
     preview_url: str | None = None
     illust_type: int = 0
+    ai_type: int | None = None
+    ai_filtered: bool = False
 
     @property
     def is_ugoira(self) -> bool:
@@ -43,7 +45,7 @@ class Artwork:
 
 @dataclass(slots=True)
 class Novel:
-    """保存小说搜索结果和 TXT 文件生成所需的元数据及正文"""
+    """保存小说搜索的内容标记，筛选来源和 TXT 文件所需的元数据及正文"""
 
     id: int
     title: str
@@ -55,6 +57,8 @@ class Novel:
     series_id: int | None = None
     series_title: str = ""
     content: str = ""
+    ai_type: int | None = None
+    ai_filtered: bool = False
 
     @property
     def is_r18(self) -> bool:
@@ -87,6 +91,29 @@ class NovelSeries:
             限制级标记大于 0 时返回 True，否则返回 False
         """
         return self.x_restrict > 0
+
+
+@dataclass(slots=True, frozen=True)
+class ContentPolicy:
+    """保存单次请求独立的 R18 与 AI 展示权限"""
+
+    allow_r18: bool = True
+    allow_ai: bool = True
+
+    def allows(self, work: Artwork | Novel) -> bool:
+        """根据作品标记与服务端筛选来源判断是否可以展示
+
+        Args:
+            work: 尚未下载预览或发送的搜索及推荐作品
+
+        Returns:
+            满足内容偏好时返回 True，隐藏 AI 时拒绝未经筛选的未知标记
+        """
+        return (self.allow_r18 or not work.is_r18) and (
+            self.allow_ai
+            or work.ai_type in (0, 1)
+            or (work.ai_type is None and work.ai_filtered)
+        )
 
 
 @dataclass(slots=True)

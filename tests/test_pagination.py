@@ -8,7 +8,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent, PrivateMessageEvent
 
 from nonebot_plugin_pixiv_dl import commands, pagination
 from nonebot_plugin_pixiv_dl.config import Config
-from nonebot_plugin_pixiv_dl.models import Artwork, Novel, SearchPage
+from nonebot_plugin_pixiv_dl.models import Artwork, ContentPolicy, Novel, SearchPage
 from nonebot_plugin_pixiv_dl.pixiv import PixivClient, PixivNetworkError
 
 
@@ -38,13 +38,14 @@ class SearchHarness:
         monkeypatch.setattr(commands, "_run_download", self.download)
         monkeypatch.setattr(commands.config, "pixiv_search_preview", False)
 
-    async def search(self, kind: str, word: str, page: int) -> SearchPage:
+    async def search(self, kind: str, word: str, page: int, policy: ContentPolicy) -> SearchPage:
         """记录真实请求页码并按当前场景返回成功或失败
 
         Args:
             kind: 本次请求的搜索分类
             word: 本次使用的搜索关键词
             page: 本次向客户端传入的实际页码
+            policy: 当前请求独立的内容策略
 
         Returns:
             带有页码和可配置后续页标记的模拟搜索结果
@@ -367,9 +368,9 @@ def test_related_results_replace_context_and_can_be_followed(harness, monkeypatc
 
     asyncio.run(scenario())
     assert [call.args for call in related.await_args_list] == [
-        ("manga", 1, commands.config.pixiv_search_limit),
-        ("manga", 22, commands.config.pixiv_search_limit),
-        ("novel", 999, commands.config.pixiv_search_limit),
+        ("manga", 1, commands.config.pixiv_search_limit, ContentPolicy()),
+        ("manga", 22, commands.config.pixiv_search_limit, ContentPolicy()),
+        ("novel", 999, commands.config.pixiv_search_limit, ContentPolicy()),
     ]
     assert all(call.args[1] == "正在搜索" for call in harness.send.await_args_list)
     assert [len(call.args[2]) for call in harness.forward.await_args_list[1:]] == [2, 1, 1]
@@ -915,29 +916,32 @@ def test_expiry_starts_after_first_packet_success(
     """
     first_sent_at = None
 
-    async def search(kind, word, page):
+    async def search(kind, word, page, policy):
         """复用可控搜索请求并让图片结果超过单包容量
 
         Args:
             kind: 当前请求的作品分类
             word: 用于匹配模拟搜索等待条件的关键词
             page: 当前请求的 Pixiv 页码
+            policy: 当前请求独立的内容策略
 
         Returns:
             图片含三个作品且其他分类含一个作品的模拟搜索结果
         """
-        result = await harness.search(kind, word, page)
+        result = await harness.search(kind, word, page, policy)
         items = (
             [Artwork(index, "画作", 2, "作者", [], "image", 1, 0) for index in range(10, 13)]
             if kind == "image" else result.items
         )
         return SearchPage(items, result.page, result.has_next)
 
-    async def previews(items):
+    async def previews(items, bot, event):
         """模拟预览处理超过有效期长度且此时尚未开始计时
 
         Args:
             items: 等待预览处理的图片与漫画搜索结果
+            bot: 当前发送搜索结果的机器人实例
+            event: 用于校验当前内容偏好的消息事件
 
         Returns:
             无可用图片内容的预览集合
@@ -1132,7 +1136,8 @@ def test_parse_failure_does_not_advance_cursor(harness, monkeypatch, broken: str
         nonlocal fail
         client = PixivClient(Config(pixiv_cookie="PHPSESSID=test"), httpx.MockTransport(handler))
         monkeypatch.setattr(
-            commands, "_search_kind", lambda kind, word, page: client.search_artworks(word, 1, page)
+            commands, "_search_kind",
+            lambda kind, word, page, policy: client.search_artworks(word, 1, page, policy),
         )
         try:
             await harness.run("/px搜索图片 关键词")
@@ -1146,3 +1151,124 @@ def test_parse_failure_does_not_advance_cursor(harness, monkeypatch, broken: str
 
     asyncio.run(scenario())
     assert pages == [1, 2, 2]
+
+
+@pytest.mark.parametrize("kind", ["all", "image", "manga", "novel"])
+def test_next_and_related_use_updated_preferences(harness, monkeypatch, kind):
+    """验证所有翻页入口与相关查询使用最新偏好并保持原有编号和有效期
+
+    Args:
+        harness: 记录真实事件与会话状态的测试环境
+        monkeypatch: 替换搜索和推荐返回数据的 pytest 工具
+        kind: 当前搜索模式，all 表示聚合搜索
+    """
+    items = [
+        Artwork(40, "普通", 2, "作者", [], "image", 1, 0, ai_type=0),
+        Artwork(41, "限制级", 2, "作者", [], "image", 1, 1, ai_type=0),
+        Artwork(42, "AI", 2, "作者", [], "image", 1, 0, ai_type=2),
+    ]
+    search = AsyncMock(return_value=SearchPage(items, 1, True))
+    related = AsyncMock(return_value=items)
+    monkeypatch.setattr(commands, "_search_kind", search)
+    monkeypatch.setattr(commands.client, "get_related", related)
+
+    async def scenario():
+        """在有效会话内关闭 R18 与 AI 并检查后续查询和发包"""
+        label = {"all": "", "image": "图片", "manga": "漫画", "novel": "小说"}[kind]
+        await harness.run(f"/px搜索{label} 关键词")
+        session = harness.session()
+        expires_at = session.expires_at
+        next_index = session.next_result_index
+        await commands.preferences.set("groups", "10", "100", "r18", False)
+        await commands.preferences.set("users", "10", "1", "ai", False)
+        search.return_value = SearchPage(items, 2, True)
+        await harness.run(f"/px搜索{label}下一页")
+        assert search.call_args.args[-1] == ContentPolicy(False, False)
+        assert session.results[next_index].work_id == 40
+        assert all(
+            ref.work_id == 40 for index, ref in session.results.items() if index >= next_index
+        )
+        assert session.expires_at == expires_at
+        assert all(cursor.page == 2 for cursor in session.cursors.values())
+        await harness.run("/px相关 1")
+        assert related.call_args.args[-1] == ContentPolicy(False, False)
+        assert harness.session().results == {1: pagination.SearchResultRef("image", 40)}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["query", "preview", "packet"])
+def test_inflight_search_rechecks_before_preview_and_each_packet(harness, monkeypatch, phase):
+    """验证搜索等待与预览及分包期间关闭偏好后不会发送尚未提交的受限作品
+
+    Args:
+        harness: 提供真实消息事件与发送替身的测试环境
+        monkeypatch: 替换查询和预览等待点的 pytest 工具
+        phase: 本次修改偏好发生的搜索阶段
+    """
+    items = [
+        Artwork(index, "作品", 2, "作者", [], "image", 1, int(index == 3),
+                ai_type=2 if index == 4 else 0)
+        for index in range(1, 6)
+    ]
+    previewed = []
+
+    async def disable():
+        """同时关闭当前群 R18 和发起用户的 AI 展示许可"""
+        await commands.preferences.set("groups", "10", "100", "r18", False)
+        await commands.preferences.set("users", "10", "1", "ai", False)
+
+    async def search(kind, word, page, policy):
+        """在元数据返回前模拟其他设置命令生效
+
+        Args:
+            kind: 当前请求的作品分类
+            word: 用于查询的关键词
+            page: 本次搜索起始页码
+            policy: 请求开始时独立计算的内容偏好
+
+        Returns:
+            含有之后可能被关闭的 R18 与 AI 作品列表
+        """
+        if phase == "query":
+            await disable()
+        return SearchPage(items, page, False)
+
+    async def previews(works, bot, event):
+        """记录预览前过滤结果并模拟图片处理期间更新设置
+
+        Args:
+            works: 已经通过查询后权限检查的作品列表
+            bot: 当前发送搜索结果的机器人
+            event: 决定当前群和用户的消息事件
+
+        Returns:
+            无实际媒体内容的预览集合
+        """
+        previewed.extend(item.id for item in works)
+        if phase == "preview":
+            await disable()
+        return {}
+
+    async def forward(bot, event, packet):
+        """在首包发送后模拟关闭待发作品的权限
+
+        Args:
+            bot: 用于发送当前分包的机器人
+            event: 决定当前请求者的消息事件
+            packet: 已通过最新策略校验的搜索分包
+        """
+        if phase == "packet":
+            await disable()
+
+    monkeypatch.setattr(commands, "_search_kind", search)
+    monkeypatch.setattr(commands, "_search_previews", previews)
+    monkeypatch.setattr(commands.config, "pixiv_forward_max_messages", 2)
+    harness.forward.side_effect = forward
+    asyncio.run(harness.run("/px搜索图片 关键词"))
+    assert list(harness.session().results) == [1, 2, 3]
+    assert [ref.work_id for ref in harness.session().results.values()] == [1, 2, 5]
+    if phase == "query":
+        assert previewed == [1, 2, 5]
+    assert [call.args[2][0].data["content"].splitlines()[0]
+            for call in harness.forward.await_args_list] == ["[1]", "[3]"]

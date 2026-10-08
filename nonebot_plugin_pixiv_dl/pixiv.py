@@ -12,6 +12,7 @@ import httpx
 from .config import Config
 from .models import (
     Artwork,
+    ContentPolicy,
     Novel,
     NovelSeries,
     SearchPage,
@@ -198,6 +199,22 @@ def _preview_url(item: dict) -> str | None:
     return None
 
 
+def _ai_type(item: dict) -> int | None:
+    """读取 Pixiv 的两种 AI 标记字段，保留未知状态
+
+    Args:
+        item: 搜索，推荐或详情接口提供的作品字段
+
+    Returns:
+        已识别的 0，1 或 2 标记，缺失或无法识别时返回 None
+    """
+    values = [item.get("aiType"), item.get("ai_type")]
+    for marker in (2, 1, 0):
+        if any(type(value) in (int, str) and str(value) == str(marker) for value in values):
+            return marker
+    return None
+
+
 def _search_artwork(item: dict, kind: str) -> Artwork:
     """将搜索结果转换为保留原始分类和低清预览地址的作品模型
 
@@ -219,6 +236,7 @@ def _search_artwork(item: dict, kind: str) -> Artwork:
         x_restrict=int(item.get("xRestrict") or 0),
         preview_url=_preview_url(item),
         illust_type=int(item.get("illustType") or (1 if kind == "manga" else 0)),
+        ai_type=_ai_type(item),
     )
 
 
@@ -242,6 +260,7 @@ def _search_novel(item: dict) -> Novel:
         description=_description(item.get("description")),
         series_id=int(series_id) if series_id else None,
         series_title=str(item.get("seriesTitle") or ""),
+        ai_type=_ai_type(item),
     )
 
 
@@ -334,14 +353,18 @@ class PixivClient:
             raise PixivNotFoundError(f"{path}: empty body")
         return body
 
-    async def _search(self, kind: str, word: str, limit: int, page: int = 1) -> SearchPage:
-        """分页查询指定分类作品，按配置过滤限制级内容
+    async def _search(
+        self, kind: str, word: str, limit: int, page: int = 1,
+        policy: ContentPolicy | None = None,
+    ) -> SearchPage:
+        """按独立请求策略过滤内容，最多读取 3 页以补充结果
 
         Args:
             kind: 请求的作品分类
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
             page: 本批查询起始的 Pixiv 页码，从 1 开始
+            policy: 当前请求的内容偏好，空值表示沿用全局 R18 配置并接收 AI
 
         Returns:
             按接口顺序排列的限量预览，实际最后读取页码和后续页标记
@@ -354,23 +377,28 @@ class PixivClient:
         """
         if page < 1 or limit < 1:
             raise PixivAPIError("搜索页码与结果上限必须大于 0")
+        policy = policy or ContentPolicy()
+        policy = ContentPolicy(self.config.pixiv_r18 and policy.allow_r18, policy.allow_ai)
         route, key, work_type = {
             "image": ("illustrations", "illust", "illust_and_ugoira"),
             "manga": ("manga", "manga", "manga"),
             "novel": ("novels", "novel", None),
         }[kind]
         result: list[Artwork] | list[Novel] = []
+        last_page = page + 2
         while len(result) < limit:
             params = {
                 "word": word,
                 "order": "date_d",
-                "mode": "all" if self.config.pixiv_r18 else "safe",
+                "mode": "all" if policy.allow_r18 else "safe",
                 "s_mode": "s_tag",
                 "p": page,
                 "lang": "zh",
             }
             if work_type:
                 params["type"] = work_type
+            if not policy.allow_ai:
+                params["ai_type"] = 1
             body = await self._json(f"/ajax/search/{route}/{quote(word, safe='')}", params)
             if not isinstance(body, dict) or not isinstance(body.get(key), dict):
                 raise PixivAPIError(f"/ajax/search/{route}: invalid result")
@@ -395,22 +423,26 @@ class PixivClient:
                 if kind == "manga" and illust_type not in (None, 1):
                     continue
                 model = _search_novel(item) if kind == "novel" else _search_artwork(item, kind)
-                if self.config.pixiv_r18 or not model.is_r18:
+                model.ai_filtered = not policy.allow_ai
+                if policy.allows(model):
                     result.append(model)
                     if len(result) == limit:
                         break
-            if not has_next or len(result) == limit or len(items) < 60:
+            if not has_next or len(result) == limit or len(items) < 60 or page >= last_page:
                 break
             page += 1
         return SearchPage(result, page, has_next)
 
-    async def search_artworks(self, word: str, limit: int, page: int = 1) -> SearchPage:
+    async def search_artworks(
+        self, word: str, limit: int, page: int = 1, policy: ContentPolicy | None = None
+    ) -> SearchPage:
         """查询包含普通插画和 Ugoira 的图片搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
             page: 本批查询起始的 Pixiv 页码，从 1 开始
+            policy: 当前请求的内容偏好，空值表示沿用全局 R18 配置并接收 AI
 
         Returns:
             不超过指定数量的图片元数据，最后读取页码和后续页标记
@@ -421,15 +453,18 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
-        return await self._search("image", word, limit, page)
+        return await self._search("image", word, limit, page, policy)
 
-    async def search_manga(self, word: str, limit: int, page: int = 1) -> SearchPage:
+    async def search_manga(
+        self, word: str, limit: int, page: int = 1, policy: ContentPolicy | None = None
+    ) -> SearchPage:
         """查询漫画搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
             page: 本批查询起始的 Pixiv 页码，从 1 开始
+            policy: 当前请求的内容偏好，空值表示沿用全局 R18 配置并接收 AI
 
         Returns:
             不超过指定数量的漫画元数据，最后读取页码和后续页标记
@@ -440,15 +475,18 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
-        return await self._search("manga", word, limit, page)
+        return await self._search("manga", word, limit, page, policy)
 
-    async def search_novels(self, word: str, limit: int, page: int = 1) -> SearchPage:
+    async def search_novels(
+        self, word: str, limit: int, page: int = 1, policy: ContentPolicy | None = None
+    ) -> SearchPage:
         """查询小说搜索预览
 
         Args:
             word: 用于匹配作品标签的搜索关键词
             limit: 本次最多返回的搜索结果数
             page: 本批查询起始的 Pixiv 页码，从 1 开始
+            policy: 当前请求的内容偏好，空值表示沿用全局 R18 配置并接收 AI
 
         Returns:
             不超过指定数量的小说元数据，最后读取页码和后续页标记
@@ -459,15 +497,18 @@ class PixivClient:
             PixivNetworkError: 请求超时或网络连接失败
             PixivAPIError: HTTP 请求失败或 Pixiv 返回无效业务数据
         """
-        return await self._search("novel", word, limit, page)
+        return await self._search("novel", word, limit, page, policy)
 
-    async def get_related(self, kind: str, work_id: int, limit: int) -> list[Artwork] | list[Novel]:
-        """查询首批相关作品，复用搜索模型解析并过滤限制级内容
+    async def get_related(
+        self, kind: str, work_id: int, limit: int, policy: ContentPolicy | None = None
+    ) -> list[Artwork] | list[Novel]:
+        """查询首批相关作品，按请求偏好过滤限制级内容与 AI 标记
 
         Args:
             kind: 源作品分类，插画，漫画及动图共用插画相关接口
             work_id: 用于查找相关作品的 Pixiv ID
             limit: 本次最多返回的相关作品数量
+            policy: 当前请求的内容偏好，空值表示沿用全局 R18 配置并接收 AI
 
         Returns:
             按接口顺序排列的作品预览，不包含后续推荐页
@@ -480,6 +521,8 @@ class PixivClient:
         """
         if kind not in ("image", "manga", "novel") or work_id < 1 or limit < 1:
             raise PixivAPIError("相关作品分类与数量或作品 ID 无效")
+        policy = policy or ContentPolicy()
+        policy = ContentPolicy(self.config.pixiv_r18 and policy.allow_r18, policy.allow_ai)
         route, key = ("novel", "novels") if kind == "novel" else ("illust", "illusts")
         body = await self._json(f"/ajax/{route}/{work_id}/recommend/init", {"limit": limit})
         if not isinstance(body, dict) or not isinstance(body.get(key), list):
@@ -498,7 +541,7 @@ class PixivClient:
                 )
             except (TypeError, ValueError) as exc:
                 raise PixivAPIError("相关作品字段无效") from exc
-            if self.config.pixiv_r18 or not model.is_r18:
+            if policy.allows(model):
                 results.append(model)
                 if len(results) == limit:
                     break
@@ -540,6 +583,7 @@ class PixivClient:
             x_restrict=int(body.get("xRestrict") or 0),
             description=_description(body.get("description")),
             illust_type=illust_type,
+            ai_type=_ai_type(body),
         )
         self._check_r18(artwork)
         return artwork
@@ -678,6 +722,7 @@ class PixivClient:
             series_id=int(series["id"]) if series.get("id") else None,
             series_title=str(series.get("title") or ""),
             content=html.unescape(str(details["text"])),
+            ai_type=_ai_type(details),
         )
         self._check_r18(novel)
         return novel

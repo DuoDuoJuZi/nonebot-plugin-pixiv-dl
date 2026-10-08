@@ -147,7 +147,9 @@ def test_search_ugoira_static_preview_and_safe_failure(
         bot = SimpleNamespace(
             self_id="10", send=AsyncMock(return_value={"message_id": 99}), delete_msg=AsyncMock()
         )
-        event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
+        event = SimpleNamespace(
+            message_type="private", get_session_id=lambda: "1", get_user_id=lambda: "1"
+        )
         forward = AsyncMock()
         monkeypatch.setattr(commands, "config", config)
         monkeypatch.setattr(commands, "client", client)
@@ -320,6 +322,7 @@ def test_download_original_once_and_independent_outputs(
         assert any(isinstance(action, str) and "类型：图片（动图）" in action for action in actions)
         archive = Path(kwargs["file"])
         assert archive.is_absolute()
+        assert archive.parent.parent == commands.ugoira_cache_dir
         assert archive.name == "42_ugoira.zip"
         paths.append(archive)
         assert archive.read_bytes() == archive_data
@@ -420,4 +423,58 @@ def test_download_original_once_and_independent_outputs(
                 ),
             }
             assert actions[-1] == expected[failure]
+
+
+def test_r18_disabled_during_conversion_stops_video(monkeypatch):
+    """验证转码期间关闭 R18 会阻止 MP4 发送并保留原有临时资源清理
+
+    Args:
+        monkeypatch: 替换媒体下载与转换等待点的 pytest 工具
+    """
+    from nonebot_plugin_pixiv_dl.models import Artwork
+
+    archive_data, meta = make_archive()
+    work = Artwork(42, "动图", 1, "作者", [], "image", 1, 1, illust_type=2)
+    bot = SimpleNamespace(
+        self_id="10", send=AsyncMock(return_value={"message_id": 1}), delete_msg=AsyncMock()
+    )
+    event = make_event(True)
+    paths = []
+    zip_send = AsyncMock(return_value=message.MediaSendResult.SUCCESS)
+    video_send = AsyncMock()
+
+    async def download(url, destination):
+        """将合成 ZIP 保存到真实请求临时目录
+
+        Args:
+            url: 动图元数据提供的原始 ZIP 地址
+            destination: LocalStore 缓存目录下的独立 ZIP 文件路径
+        """
+        assert destination.parent.parent == commands.ugoira_cache_dir
+        paths.append(destination)
+        destination.write_bytes(archive_data)
+
+    async def convert(archive, received, output):
+        """模拟转码等待期间超级用户通过配置关闭内容许可
+
+        Args:
+            archive: 当前请求已下载的 ZIP 文件
+            received: 描述原始帧顺序的动图元数据
+            output: 转换完成后尚未发送的视频路径
+        """
+        output.write_bytes(b"video")
+        paths.append(output)
+        await commands.preferences.set("groups", "10", "30", "r18", False)
+
+    monkeypatch.setattr(commands.client, "get_illust", AsyncMock(return_value=work))
+    monkeypatch.setattr(commands.client, "get_ugoira_meta", AsyncMock(return_value=meta))
+    monkeypatch.setattr(commands.client, "download_ugoira_archive", download)
+    monkeypatch.setattr(commands, "send_ugoira_zip", zip_send)
+    monkeypatch.setattr(commands, "send_ugoira_video", video_send)
+    monkeypatch.setattr(ugoira, "convert_to_mp4", convert)
+    asyncio.run(commands._run_download(bot, event, "image", 42))
+    zip_send.assert_awaited_once()
+    video_send.assert_not_awaited()
+    assert all(not path.exists() for path in paths)
+    assert not ugoira.cleanup_tasks
 

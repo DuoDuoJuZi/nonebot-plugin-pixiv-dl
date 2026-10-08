@@ -3,8 +3,10 @@ import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import nonebot_plugin_localstore as store
 from nonebot import get_driver, get_plugin_config, logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment
+from nonebot.permission import SUPERUSER
 
 from . import pagination, ugoira
 from .config import Config
@@ -24,7 +26,7 @@ from .message import (
     send_ugoira_zip,
     write_novel_file,
 )
-from .models import Artwork, Novel, SearchPage
+from .models import Artwork, ContentPolicy, Novel, NovelSeries, SearchPage
 from .pagination import (
     SearchCursor,
     SearchResultRef,
@@ -34,6 +36,7 @@ from .pagination import (
     sessions,
 )
 from .pixiv import PixivAPIError, PixivClient, PixivNotFoundError, PixivR18Error, PixivResourceError
+from .preferences import PreferenceError, PreferenceStore
 
 SEARCH_RE = re.compile(
     r"^/px搜索(?!(?:图片|漫画|小说)?下一页\s*$)"
@@ -42,10 +45,14 @@ SEARCH_RE = re.compile(
 NEXT_RE = re.compile(r"^/px搜索(图片|漫画|小说)?下一页\s*$")
 DOWNLOAD_RE = re.compile(r"^/px下载(图片|漫画|小说)?\s*(\d+)\s*$")
 RELATED_RE = re.compile(r"^/px相关\s*(0*[1-9][0-9]*)\s*$")
+GROUP_RE = re.compile(r"^/px群R18\s+([1-9][0-9]*)(?:\s+(开|关))?\s*$")
+SETTINGS_RE = re.compile(r"^/px设置(?:\s+(R18|AI)\s+(开|关))?\s*$")
 KINDS = {"图片": "image", "漫画": "manga", "小说": "novel"}
 
 config = get_plugin_config(Config)
 client = PixivClient(config)
+preferences = PreferenceStore(store.get_plugin_data_dir())
+ugoira_cache_dir = store.get_plugin_cache_dir()
 preview_semaphore = asyncio.Semaphore(config.pixiv_preview_concurrency)
 get_driver().on_shutdown(client.close)
 get_driver().on_shutdown(ugoira.cleanup_pending_directories)
@@ -54,6 +61,8 @@ search_matcher = on_regex(SEARCH_RE.pattern, priority=10, block=True)
 next_matcher = on_regex(NEXT_RE.pattern, priority=9, block=True)
 download_matcher = on_regex(DOWNLOAD_RE.pattern, priority=10, block=True)
 related_matcher = on_regex(RELATED_RE.pattern, priority=10, block=True)
+group_matcher = on_regex(GROUP_RE.pattern, permission=SUPERUSER, priority=10, block=True)
+settings_matcher = on_regex(SETTINGS_RE.pattern, priority=10, block=True)
 
 
 # @Author: DuoDuoJuZi
@@ -101,13 +110,50 @@ async def _recall(bot: Bot, status: dict) -> None:
         logger.warning("Pixiv 状态消息撤回失败", exc_info=True)
 
 
-async def _search_kind(kind: str, word: str, page: int) -> SearchPage:
+async def _get_policy(bot: Bot, event: MessageEvent) -> ContentPolicy:
+    """从当前消息身份读取最新内容偏好，不修改共享客户端配置
+
+    Args:
+        bot: 当前接收命令的机器人实例
+        event: 用于确定发送者和当前群号的消息事件
+
+    Returns:
+        当前请求者有效的 R18 与 AI 策略
+
+    Raises:
+        PreferenceError: 相关设置文件损坏或无法读取
+    """
+    group_id = str(event.group_id) if event.message_type == "group" else None
+    return await preferences.policy(bot.self_id, event.get_user_id(), group_id, config.pixiv_r18)
+
+
+async def _check_download(
+    bot: Bot, event: MessageEvent, *works: Artwork | Novel | NovelSeries
+) -> None:
+    """按最新 R18 权限检查待下载或发送的资源，主动下载不限制 AI
+
+    Args:
+        bot: 当前接收命令的机器人实例
+        event: 决定个人与群设置的消息事件
+        works: 本次资源所属作品，小说系列或全部待发送章节
+
+    Raises:
+        PreferenceError: 相关设置文件不可用
+        PixivR18Error: 当前策略禁止资源中的限制级内容
+    """
+    policy = await _get_policy(bot, event)
+    if not policy.allow_r18 and any(work.is_r18 for work in works):
+        raise PixivR18Error("当前请求已关闭 R18")
+
+
+async def _search_kind(kind: str, word: str, page: int, policy: ContentPolicy) -> SearchPage:
     """调用指定分类的 Pixiv 搜索接口
 
     Args:
         kind: 请求的作品分类
         word: 用于匹配作品标签的搜索关键词
         page: 本批查询起始的 Pixiv 页码
+        policy: 由当前群和发送者偏好计算的独立内容策略
 
     Returns:
         符合配置数量上限的该分类预览及实际分页信息
@@ -123,14 +169,16 @@ async def _search_kind(kind: str, word: str, page: int) -> SearchPage:
         "manga": client.search_manga,
         "novel": client.search_novels,
     }[kind]
-    return await method(word, config.pixiv_search_limit, page)
+    return await method(word, config.pixiv_search_limit, page, policy)
 
 
-async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
+async def _search_previews(items: list[Artwork], bot: Bot, event: MessageEvent) -> dict[int, bytes]:
     """有限并发处理第一页静态缩略图，动图与普通图片共用预览流程
 
     Args:
         items: 按结果顺序排列的插画，动图或漫画元数据
+        bot: 当前接收命令的机器人实例
+        event: 用于在预览下载前重新读取群和个人偏好的消息事件
 
     Returns:
         按作品 ID 保存的成功处理预览，关闭预览时返回空字典
@@ -151,6 +199,8 @@ async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
             return None
         try:
             async with preview_semaphore:
+                if not (await _get_policy(bot, event)).allows(item):
+                    return None
                 data = await client.download_image(item.preview_url)
                 return await asyncio.to_thread(
                     process_preview, data, item.is_r18, config.pixiv_preview_max_edge
@@ -206,19 +256,23 @@ async def _send_result_packets(
         pagination_hint: 当前分类最后一包的分页提示，空值表示相关作品不追加提示节点
     """
     key = session_key(bot, event)
-    packets = build_search_forward(
-        items, "all", config.pixiv_forward_max_messages, int(bot.self_id), previews,
-        start_index=session.next_result_index,
-    )
-    offset = 0
-    for packet in packets:
+    while items:
+        policy = await _get_policy(bot, event)
+        items = [item for item in items if policy.allows(item)]
+        if not items:
+            return
         if sessions.get(key) is not previous:
             return
-        result_count = len(packet)
+        current = items[: config.pixiv_forward_max_messages]
+        packet = build_search_forward(
+            current, "all", config.pixiv_forward_max_messages, int(bot.self_id), previews,
+            start_index=session.next_result_index,
+        )[0]
+        result_count = len(current)
         if pagination_hint is not None:
             hint = (
                 "本次结果还有后续分包，将自动发送"
-                if offset + result_count < len(items) else pagination_hint
+                if result_count < len(items) else pagination_hint
             )
             packet.append(
                 MessageSegment.node_custom(int(bot.self_id), "Pixiv 提示", f"[提示]\n{hint}")
@@ -226,11 +280,11 @@ async def _send_result_packets(
         await send_forward(bot, event, packet)
         if sessions.get(key) is not previous:
             return
-        for item in items[offset : offset + result_count]:
+        for item in current:
             kind = "novel" if isinstance(item, Novel) else item.type
             session.results[session.next_result_index] = SearchResultRef(kind, item.id)
             session.next_result_index += 1
-        offset += result_count
+        items = items[result_count:]
         if session.expires_at is None:
             session.expires_at = pagination.monotonic() + pagination.SEARCH_SESSION_TTL
         sessions[key] = session
@@ -259,8 +313,9 @@ async def _search_and_send(
     aggregate = session.kind == "all"
     try:
         status = await bot.send(event, "正在搜索")
+        policy = await _get_policy(bot, event)
         results = await asyncio.gather(
-            *(_search_kind(kind, session.word, page) for kind, page in targets.items()),
+            *(_search_kind(kind, session.word, page, policy) for kind, page in targets.items()),
             return_exceptions=True,
         )
         if sessions.get(key) is not session:
@@ -275,13 +330,16 @@ async def _search_and_send(
         if selected in successful:
             session.kind = selected
             session.cursors = {selected: session.cursors[selected]}
+        policy = await _get_policy(bot, event)
+        for result in successful.values():
+            result.items = [item for item in result.items if policy.allows(item)]
         previews = await _search_previews(
             [
                 item
                 for result in successful.values()
                 for item in result.items
                 if isinstance(item, Artwork)
-            ]
+            ], bot, event,
         )
         await _recall(bot, status)
         status = None
@@ -453,13 +511,18 @@ async def _run_related(bot: Bot, event: MessageEvent, number: int) -> None:
     status = None
     try:
         status = await bot.send(event, "正在搜索")
+        policy = await _get_policy(bot, event)
         if reference:
             kind = reference.kind
         else:
             work = await _get_download_target("auto", work_id)
             kind = "novel" if isinstance(work, Novel) else work.type
-        items = await client.get_related(kind, work_id, config.pixiv_search_limit)
-        previews = await _search_previews([item for item in items if isinstance(item, Artwork)])
+        items = await client.get_related(kind, work_id, config.pixiv_search_limit, policy)
+        policy = await _get_policy(bot, event)
+        items = [item for item in items if policy.allows(item)]
+        previews = await _search_previews(
+            [item for item in items if isinstance(item, Artwork)], bot, event
+        )
         await _recall(bot, status)
         status = None
         if sessions.get(key) is not previous:
@@ -545,17 +608,19 @@ async def _run_ugoira_download(
     retain_files = False
     phase = "原始帧 ZIP 下载"
     try:
-        if work.is_r18 and not config.pixiv_r18:
-            raise PixivR18Error(f"{work.id}: R18 已关闭")
+        await _check_download(bot, event, work)
         meta = await client.get_ugoira_meta(work.id)
-        directory = TemporaryDirectory(prefix="nonebot-pixiv-ugoira-")
+        directory = TemporaryDirectory(prefix="nonebot-pixiv-ugoira-", dir=ugoira_cache_dir)
         folder = Path(directory.name)
         archive = folder / f"{work.id}_ugoira.zip"
         output = folder / f"{work.id}_ugoira.mp4"
+        await _check_download(bot, event, work)
         await client.download_ugoira_archive(meta.original_src, archive)
         await _recall(bot, status)
         status = None
+        await _check_download(bot, event, work)
         await _send_ugoira_notice(bot, event, format_ugoira(work, meta))
+        await _check_download(bot, event, work)
         retain_files = True
         zip_result = await send_ugoira_zip(bot, event, archive, work.id)
         retain_files = zip_result is MediaSendResult.UNKNOWN
@@ -573,6 +638,7 @@ async def _run_ugoira_download(
             await _recall(bot, status)
             status = None
         phase = "MP4 视频发送"
+        await _check_download(bot, event, work)
         retain_files = True
         video_result = await send_ugoira_video(bot, event, output, work.id)
         retain_files = MediaSendResult.UNKNOWN in (zip_result, video_result)
@@ -612,6 +678,7 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
     recalled = False
     try:
         target = await _get_download_target(kind, work_id)
+        await _check_download(bot, event, target)
         if isinstance(target, Artwork) and target.is_ugoira:
             recalled = True
             await _run_ugoira_download(bot, event, target, status)
@@ -623,20 +690,27 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
                     series = await client.get_novel_series(
                         target.series_id, config.pixiv_novel_max_chapters
                     )
+                    await _check_download(bot, event, target, series, *series.chapters)
                     chapters = []
                     for item in series.chapters:
+                        await _check_download(bot, event, target, series, item)
                         try:
-                            chapters.append(await client.get_novel(item.id))
+                            chapter = await client.get_novel(item.id)
+                        except PixivR18Error:
+                            raise
                         except Exception as exc:
                             raise PixivAPIError(
                                 f"series {series.id}, chapter {item.id}: {exc}"
                             ) from exc
+                        await _check_download(bot, event, chapter)
+                        chapters.append(chapter)
                     paths = [
                         write_novel_file(chapter, folder, index)
                         for index, chapter in enumerate(chapters, 1)
                     ]
                     metadata = format_series(series, len(paths))
                 else:
+                    chapters = [target]
                     paths = [write_novel_file(target, folder)]
                     metadata = format_novel(target)
                 if not paths:
@@ -645,6 +719,9 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
                     metadata, paths, config.pixiv_forward_max_messages, int(bot.self_id)
                 )
                 for packet in packets:
+                    await _check_download(
+                        bot, event, target, *chapters, *([series] if target.series_id else [])
+                    )
                     await send_forward(bot, event, packet)
                 await _recall(bot, status)
                 recalled = True
@@ -654,6 +731,7 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
                 urls = urls[: config.pixiv_download_max_pages]
             images = []
             for page, url in enumerate(urls, 1):
+                await _check_download(bot, event, target)
                 try:
                     images.append(await client.download_image(url))
                 except Exception as exc:
@@ -664,6 +742,7 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
                 target, images, config.pixiv_forward_max_messages, int(bot.self_id)
             )
             for packet in packets:
+                await _check_download(bot, event, target)
                 await send_forward(bot, event, packet)
     except PixivR18Error:
         if not recalled:
@@ -674,6 +753,62 @@ async def _run_download(bot: Bot, event: MessageEvent, kind: str, work_id: int) 
         if not recalled:
             await _recall(bot, status)
         await bot.send(event, "下载失败")
+
+
+@group_matcher.handle()
+async def handle_group_settings(bot: Bot, event: MessageEvent) -> None:
+    """仅允许 NoneBot 原生 SUPERUSER 查看或修改指定群的 R18 开关
+
+    Args:
+        bot: 用于确定设置归属和回复状态的机器人实例
+        event: 提供权限校验身份与群设置命令的消息事件
+    """
+    if not await SUPERUSER(bot, event):
+        return
+    match = GROUP_RE.fullmatch(event.get_plaintext())
+    if not match:
+        return
+    group_id, value = match.groups()
+    try:
+        if value is not None:
+            await preferences.set("groups", bot.self_id, group_id, "r18", value == "开")
+        settings = await preferences.get("groups", bot.self_id, group_id)
+        state = "开" if settings["r18"] else "关"
+        await bot.send(event, f"群 {group_id} R18：{state}")
+    except PreferenceError as exc:
+        await bot.send(event, str(exc))
+
+
+@settings_matcher.handle()
+async def handle_settings(bot: Bot, event: MessageEvent) -> None:
+    """查看或修改发送者本人在当前机器人中的内容偏好
+
+    Args:
+        bot: 用于确定设置归属和回复状态的机器人实例
+        event: 提供唯一目标用户身份和个人设置命令的消息事件
+    """
+    match = SETTINGS_RE.fullmatch(event.get_plaintext())
+    if not match:
+        return
+    field, value = match.groups()
+    try:
+        if field is not None:
+            await preferences.set(
+                "users", bot.self_id, event.get_user_id(), field.lower(), value == "开"
+            )
+            await bot.send(event, f"个人设置：{field} {value}")
+            return
+        settings = await preferences.get("users", bot.self_id, event.get_user_id())
+        r18 = "开" if settings["r18"] else "关"
+        ai = "开" if settings["ai"] else "关"
+        text = f"个人设置：R18 {r18}，AI {ai}"
+        if event.message_type == "group":
+            group = await preferences.get("groups", bot.self_id, str(event.group_id))
+            state = "开" if group["r18"] else "关"
+            text += f"，当前群 R18 {state}"
+        await bot.send(event, text)
+    except PreferenceError as exc:
+        await bot.send(event, str(exc))
 
 
 @search_matcher.handle()

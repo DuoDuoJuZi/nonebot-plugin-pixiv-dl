@@ -78,7 +78,9 @@ async def run_search(monkeypatch, handler, kind: str = "image", **options) -> li
         send=AsyncMock(return_value={"message_id": 99}),
         delete_msg=AsyncMock(),
     )
-    event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
+    event = SimpleNamespace(
+        message_type="private", get_session_id=lambda: "1", get_user_id=lambda: "1"
+    )
     monkeypatch.setattr(commands, "config", config)
     monkeypatch.setattr(commands, "client", client)
     monkeypatch.setattr(
@@ -538,7 +540,9 @@ def test_next_page_preserves_previews_blur_metadata_and_packets(monkeypatch, kin
         )
         client = PixivClient(config, httpx.MockTransport(handler))
         bot = SimpleNamespace(self_id="10", send=send, delete_msg=recall)
-        event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
+        event = SimpleNamespace(
+            message_type="private", get_session_id=lambda: "1", get_user_id=lambda: "1"
+        )
         monkeypatch.setattr(commands, "config", config)
         monkeypatch.setattr(commands, "client", client)
         monkeypatch.setattr(commands, "preview_semaphore", asyncio.Semaphore(4))

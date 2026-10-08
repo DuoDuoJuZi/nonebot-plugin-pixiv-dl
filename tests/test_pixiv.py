@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from nonebot_plugin_pixiv_dl.config import Config
-from nonebot_plugin_pixiv_dl.models import Novel
+from nonebot_plugin_pixiv_dl.models import ContentPolicy, Novel
 from nonebot_plugin_pixiv_dl.pixiv import (
     FixedIPBackend,
     FixedIPTransport,
@@ -49,6 +49,124 @@ def make_client(handler, **options) -> PixivClient:
         Config(pixiv_cookie="test_cookie=placeholder", **options),
         transport=httpx.MockTransport(handler),
     )
+
+
+@pytest.mark.parametrize("kind", ["image", "manga", "novel"])
+@pytest.mark.parametrize("related", [False, True])
+@pytest.mark.parametrize("global_r18,r18,ai", [
+    (True, True, True), (True, True, False), (True, False, True),
+    (True, False, False), (False, True, True), (False, True, False),
+])
+def test_request_policy_filters_without_detail_requests(kind, related, global_r18, r18, ai):
+    """验证独立策略，AI 字段差异及缺少标记时的保守筛选
+
+    Args:
+        kind: 本次搜索或推荐的作品分类
+        related: 是否使用缺少服务端 AI 筛选的推荐接口
+        global_r18: 共享客户端的全局 R18 配置
+        r18: 当前请求者的 R18 偏好
+        ai: 当前请求者的 AI 接收偏好
+    """
+    items = [
+        {"id": 1, "aiType": 0, "tags": ["AI生成"]},
+        {"id": 2, "aiType": 1},
+        {"id": 3, "aiType": 2},
+        {"id": 4, "aiType": 0, "xRestrict": 1},
+        {"id": 5, "aiType": 2, "xRestrict": 2},
+        {"id": 6},
+        {"id": 7, "ai_type": "2"},
+        {"id": 8, "aiType": None, "ai_type": 1},
+        {"id": 9, "aiType": "unknown"},
+    ]
+    if kind != "novel":
+        for item in items:
+            item["illustType"] = 1 if kind == "manga" else (2 if item["id"] == 2 else 0)
+    requests = []
+
+    def handler(request):
+        """只允许搜索或推荐元数据请求并检查服务端筛选参数
+
+        Args:
+            request: 本次模拟传输层接收到的 HTTP 请求
+
+        Returns:
+            同时包含普通，限制级，AI 及未知标记的作品响应
+        """
+        requests.append(request)
+        if related:
+            route, key = ("novel", "novels") if kind == "novel" else ("illust", "illusts")
+            assert request.url.path == f"/ajax/{route}/99/recommend/init"
+            return ajax({key: items})
+        assert request.url.path.startswith("/ajax/search/")
+        assert request.url.params["mode"] == ("all" if global_r18 and r18 else "safe")
+        assert request.url.params.get("ai_type") == (None if ai else "1")
+        key = {"image": "illust", "manga": "manga", "novel": "novel"}[kind]
+        return ajax({key: {"data": items, "lastPage": 1}})
+
+    async def scenario():
+        """核对所有分类的顺序和独立策略，不改变共享配置"""
+        client = make_client(handler, pixiv_r18=global_r18)
+        policy = ContentPolicy(r18, ai)
+        try:
+            if related:
+                results = await client.get_related(kind, 99, 20, policy)
+            else:
+                method = {
+                    "image": client.search_artworks,
+                    "manga": client.search_manga,
+                    "novel": client.search_novels,
+                }[kind]
+                results = (await method("测试", 20, policy=policy)).items
+            expected = set(range(1, 10))
+            if not global_r18 or not r18:
+                expected -= {4, 5}
+            if not ai:
+                expected -= {3, 5, 7}
+                if related:
+                    expected -= {6, 9}
+            assert [item.id for item in results] == sorted(expected)
+            assert client.config.pixiv_r18 is global_r18
+            if kind == "image":
+                assert next(item for item in results if item.id == 2).is_ugoira
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert len(requests) == 1
+
+
+def test_filtering_stops_after_three_pages():
+    """验证整页被过滤时仅有限补页并保留可继续的真实游标"""
+    pages = []
+
+    def handler(request):
+        """模拟存在大量 AI 作品的连续搜索页
+
+        Args:
+            request: 包含待查询 Pixiv 页码的模拟请求
+
+        Returns:
+            满页 AI 作品与仍有后续页的标记
+        """
+        pages.append(int(request.url.params["p"]))
+        return ajax({"illust": {
+            "data": [{"id": index, "aiType": 2} for index in range(1, 61)],
+            "lastPage": 100,
+        }})
+
+    async def scenario():
+        """在指定起始页执行隐藏 AI 的搜索并检查查询上限"""
+        client = make_client(handler)
+        try:
+            result = await client.search_artworks("测试", 20, 4, ContentPolicy(True, False))
+            assert result.items == []
+            assert result.page == 6
+            assert result.has_next
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert pages == [4, 5, 6]
 
 
 def test_proxy_routing_configuration() -> None:
