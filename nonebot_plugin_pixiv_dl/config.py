@@ -19,8 +19,6 @@ class Config(BaseModel):
     pixiv_search_preview: bool = True
     pixiv_preview_concurrency: int = Field(default=4, ge=1, le=16)
     pixiv_preview_max_edge: int = Field(default=512, ge=64, le=1024)
-    pixiv_ugoira_preview_max_edge: int = Field(default=256, ge=64, le=512)
-    pixiv_ugoira_preview_max_frames: int = Field(default=60, ge=1, le=120)
     pixiv_forward_max_messages: int = Field(default=20, ge=2, le=100)
     pixiv_download_max_pages: int = Field(default=30, ge=1, le=200)
     pixiv_novel_max_chapters: int = Field(default=50, ge=1, le=500)

@@ -4,7 +4,6 @@ import stat
 import struct
 from collections.abc import Callable
 from fractions import Fraction
-from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TypeVar
@@ -12,19 +11,16 @@ from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from imageio_ffmpeg import get_ffmpeg_exe
 from nonebot import logger
-from PIL import Image, ImageFilter
 
 from .models import UgoiraMeta
 from .pixiv import PixivError, PixivResourceError
 
-PREVIEW_ARCHIVE_LIMIT = 128 * 1024**2
 FRAME_BYTES_LIMIT = 256 * 1024**2
 EXTRACTED_BYTES_LIMIT = 8 * 1024**3
 CONVERT_TIMEOUT = 600
 MEDIA_FILE_GRACE = 300
 cleanup_tasks: set[asyncio.Task[None]] = set()
 convert_semaphore = asyncio.Semaphore(1)
-preview_semaphore = asyncio.Semaphore(1)
 Result = TypeVar("Result")
 
 
@@ -88,94 +84,6 @@ def _frame_entries(archive: ZipFile, meta: UgoiraMeta) -> list[ZipInfo]:
             raise PixivResourceError("Ugoira 解压超过单帧 256 MiB 或总量 8 GiB 上限")
         entries.append(info)
     return entries
-
-
-def build_preview_gif(
-    archive_path: Path, meta: UgoiraMeta, is_r18: bool, max_edge: int, max_frames: int
-) -> bytes:
-    """均匀选取预览帧并合并跳过帧的延时，限制级输出逐帧模糊
-
-    Args:
-        archive_path: 仅从 src 下载的临时 ZIP 路径
-        meta: 包含原始帧顺序及毫秒延时的动图元数据
-        is_r18: 是否对每张输出帧进行高斯模糊
-        max_edge: 预览最长边的像素上限
-        max_frames: 均匀采样后允许保留的最大帧数
-
-    Returns:
-        无限循环播放的小尺寸 GIF 内容
-
-    Raises:
-        UgoiraError: ZIP 损坏，帧缺失或预览编码失败
-        PixivResourceError: ZIP 解压规模超过保护上限
-    """
-    images = []
-    durations = []
-    count = min(len(meta.frames), max_frames)
-    boundaries = [index * len(meta.frames) // count for index in range(count + 1)]
-    total_ticks = (sum(frame.delay for frame in meta.frames) + 5) // 10
-    if total_ticks < count:
-        raise UgoiraError("Ugoira 时序过短，无法保持 GIF 预览总时长")
-    elapsed = 0
-    ticks = 0
-    try:
-        with ZipFile(archive_path) as archive:
-            entries = _frame_entries(archive, meta)
-            for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
-                elapsed += sum(frame.delay for frame in meta.frames[start:end])
-                next_ticks = min(
-                    total_ticks - count + index + 1, max(ticks + 1, (elapsed + 5) // 10)
-                )
-                durations.append((next_ticks - ticks) * 10)
-                ticks = next_ticks
-                with archive.open(entries[start]) as stream, Image.open(stream) as source:
-                    source.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-                    rgba = source.convert("RGBA")
-                    image = Image.new("RGB", rgba.size, "white")
-                    image.paste(rgba, mask=rgba.getchannel("A"))
-                    if is_r18:
-                        radius = max(1.0, min(3.0, min(image.size) * 0.01))
-                        image = image.filter(ImageFilter.GaussianBlur(radius))
-                    images.append(image.quantize(colors=256, method=Image.Quantize.MEDIANCUT))
-        output = BytesIO()
-        images[0].save(
-            output,
-            format="GIF",
-            save_all=True,
-            append_images=images[1:],
-            duration=durations,
-            loop=0,
-            optimize=False,
-            disposal=2,
-        )
-        return output.getvalue()
-    except (BadZipFile, OSError, ValueError, OverflowError) as exc:
-        raise UgoiraError("Ugoira GIF 预览生成失败") from exc
-    finally:
-        for image in images:
-            image.close()
-
-
-async def build_preview(
-    archive_path: Path, meta: UgoiraMeta, is_r18: bool, max_edge: int, max_frames: int
-) -> bytes:
-    """在线程中生成 GIF，取消时等待线程结束以安全清理临时文件
-
-    Args:
-        archive_path: 从 src 下载的临时 ZIP 路径
-        meta: 保留全部原始帧顺序与延时的动图元数据
-        is_r18: 是否逐帧模糊输出预览
-        max_edge: GIF 最长边的像素上限
-        max_frames: GIF 最多保留的采样帧数
-
-    Returns:
-        已完成必要模糊处理的 GIF 字节
-
-    Raises:
-        UgoiraError: 预览帧读取或编码失败
-        PixivResourceError: 解压规模超过保护上限
-    """
-    return await _run_sync(build_preview_gif, archive_path, meta, is_r18, max_edge, max_frames)
 
 
 def _frame_size(path: Path) -> tuple[int, int]:

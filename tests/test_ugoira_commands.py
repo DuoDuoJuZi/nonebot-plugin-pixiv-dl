@@ -15,7 +15,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 from PIL import Image
 from test_pixiv import ajax
-from test_preview import image_bytes, png, preview_url, run_search
+from test_preview import image_bytes, png, preview_url
 from test_ugoira import make_archive
 
 from nonebot_plugin_pixiv_dl import commands, message, ugoira
@@ -42,93 +42,167 @@ def meta_body(meta) -> dict:
     }
 
 
-@pytest.mark.parametrize("failure", [None, "metadata", "zip", "gif", "static", "blur"])
-def test_search_ugoira_gif_and_safe_fallback(monkeypatch, failure: str | None) -> None:
-    """通过真实搜索流程验证 src 来源，线程处理及限制级安全降级
+@pytest.mark.parametrize("kind", ["image", "all", "related"])
+@pytest.mark.parametrize(
+    "failure", [None, "timeout", "decode", "blur", "missing", "original", "later", "disabled"]
+)
+def test_search_ugoira_static_preview_and_safe_failure(
+    monkeypatch, kind: str, failure: str | None
+) -> None:
+    """验证搜索和相关作品只取静态缩略图，失败时保留元数据与编号
 
     Args:
         monkeypatch: 替换网络和注入预览故障的 pytest 工具
-        failure: 当前注入的预览失败阶段，空值表示动态预览成功
+        kind: 图片搜索，聚合搜索或相关作品入口
+        failure: 注入的缩略图故障或不可用场景，空值表示正常预览
     """
-    archive, meta = make_archive(3, (400, 200))
     requests = []
     source = Image.new("RGB", (300, 160), "white")
     source.paste("black", (0, 0, 150, 160))
     static = png(source)
+    blurred = message.process_preview(static, True, 512)
+    plain = message.process_preview(static, False, 512)
     owner_thread = threading.get_ident()
-    original_builder = ugoira.build_preview_gif
+    forbidden = [AsyncMock() for _ in range(3)]
+    for name, operation in zip(
+        ("get_ugoira_meta", "download_ugoira_archive", "convert_to_mp4"), forbidden, strict=True
+    ):
+        monkeypatch.setattr(ugoira if name == "convert_to_mp4" else PixivClient, name, operation)
+    ffmpeg = Mock()
+    monkeypatch.setattr(ugoira, "get_ffmpeg_exe", ffmpeg)
 
-    def builder(*args):
-        """检查 Pillow 操作离开主事件循环并按需注入失败
+    def process(data: bytes, is_r18: bool, max_edge: int) -> bytes:
+        """检查静态缩略图处理离开主事件循环
 
         Args:
-            args: 动图 ZIP 路径，元数据和预览设置
+            data: 待编码的低清缩略图内容
+            is_r18: 是否必须模糊作品预览
+            max_edge: 预览最长边的像素上限
 
         Returns:
-            正常处理后的小尺寸 GIF 字节
+            已缩放并按限制级标记处理的静态 JPEG 内容
 
         Raises:
-            OSError: 当前测试要求 GIF 处理失败
+            OSError: 注入的模糊故障或图片无法解码
         """
         assert threading.get_ident() != owner_thread
-        if failure in ("gif", "static"):
-            raise OSError("模拟 GIF 失败")
-        return original_builder(*args)
+        return message.process_preview(data, is_r18, max_edge)
 
-    monkeypatch.setattr(ugoira, "build_preview_gif", builder)
+    monkeypatch.setattr(commands, "process_preview", process)
     if failure == "blur":
         monkeypatch.setattr(Image.Image, "filter", Mock(side_effect=OSError("模拟模糊失败")))
+    items = [
+        {"id": 1, "illustType": 2, "xRestrict": 1, "url": preview_url(1)},
+        {"id": 2, "illustType": 0, "url": preview_url(2)},
+    ]
+    if failure in ("missing", "original", "later"):
+        items[0]["url"] = {
+            "missing": None,
+            "original": "https://i.pximg.net/img-original/1_p0.jpg",
+            "later": preview_url(1).replace("_p0_", "_p1_"),
+        }[failure]
 
-    def handler(request):
-        """仅允许动图请求元数据及 src，不允许搜索读取原始 ZIP
+    def handler(request: httpx.Request) -> httpx.Response:
+        """只接受搜索和相关作品元数据以及接口提供的低清第一页地址
 
         Args:
             request: 用于断言网络来源的模拟 HTTP 请求
 
         Returns:
-            混合搜索结果，动图资源或静态降级预览
+            搜索或推荐结果以及静态缩略图
+
+        Raises:
+            httpx.ReadTimeout: 当前场景要求动图缩略图下载失败
         """
         requests.append(str(request.url))
-        assert str(request.url) != meta.original_src
+        if request.url.path == "/ajax/illust/99":
+            return ajax({"illustId": 99, "illustType": 0})
+        if request.url.path == "/ajax/illust/99/recommend/init":
+            return ajax({"illusts": items})
         if "/ajax/search/" in request.url.path:
-            return ajax(
-                {
-                    "illust": {
-                        "data": [
-                            {"id": 1, "illustType": 2, "xRestrict": 1, "url": preview_url(1)},
-                            {"id": 2, "illustType": 0, "url": preview_url(2)},
-                        ]
-                    }
-                }
-            )
-        if request.url.path == "/ajax/illust/1/ugoira_meta":
-            return ajax({} if failure == "metadata" else meta_body(meta))
-        if str(request.url) == meta.src:
-            return httpx.Response(200, content=b"invalid" if failure == "zip" else archive)
-        assert str(request.url) in (preview_url(1), preview_url(2))
-        return httpx.Response(
-            200,
-            content=b"invalid" if failure == "static" else static,
-            headers={"content-type": "image/png"},
-        )
+            route = request.url.path.split("/")[3]
+            if route == "illustrations":
+                assert request.url.params["type"] == "illust_and_ugoira"
+                return ajax({"illust": {"data": items}})
+            section, work_id = {"manga": ("manga", 3), "novels": ("novel", 4)}[route]
+            return ajax({section: {"data": [{"id": work_id, "url": preview_url(work_id)}]}})
+        assert str(request.url) in (preview_url(1), preview_url(2), preview_url(3))
+        if str(request.url) == preview_url(1):
+            if failure == "timeout":
+                raise httpx.ReadTimeout("模拟缩略图超时", request=request)
+            if failure == "decode":
+                return httpx.Response(
+                    200, content=b"invalid", headers={"content-type": "image/png"}
+                )
+        return httpx.Response(200, content=static, headers={"content-type": "image/png"})
 
-    packets = asyncio.run(run_search(monkeypatch, handler))
+    async def scenario() -> list:
+        """执行真实客户端查询并核对预览失败不影响作品索引
+
+        Returns:
+            本次查询实际发送的合并转发分包
+        """
+        config = Config(pixiv_cookie="PHPSESSID=test", pixiv_search_preview=failure != "disabled")
+        client = PixivClient(config, httpx.MockTransport(handler))
+        bot = SimpleNamespace(
+            self_id="10", send=AsyncMock(return_value={"message_id": 99}), delete_msg=AsyncMock()
+        )
+        event = SimpleNamespace(message_type="private", get_session_id=lambda: "1")
+        forward = AsyncMock()
+        monkeypatch.setattr(commands, "config", config)
+        monkeypatch.setattr(commands, "client", client)
+        monkeypatch.setattr(commands, "preview_semaphore", asyncio.Semaphore(4))
+        monkeypatch.setattr(commands, "send_forward", forward)
+        try:
+            if kind == "related":
+                await commands._run_related(bot, event, 99)
+            else:
+                await commands._run_search(bot, event, kind, "测试")
+            bot.send.assert_awaited_once_with(event, "正在搜索")
+            session = commands.sessions[commands.session_key(bot, event)]
+            expected = [1, 2, 3, 4] if kind == "all" else [1, 2]
+            assert list(session.results) == expected
+            assert [reference.work_id for reference in session.results.values()] == expected
+            assert session.results[1].kind == "image"
+            return [call.args[2] for call in forward.await_args_list]
+        finally:
+            await client.close()
+
+    packets = asyncio.run(scenario())
+    for operation in [*forbidden, ffmpeg]:
+        operation.assert_not_called()
+    assert not any(
+        "ugoira_meta" in url or ".zip" in url or "img-original" in url for url in requests
+    )
+    thumbnails = {url for url in requests if "pximg.net" in url}
+    expected_thumbnails = {preview_url(index) for index in ([1, 2, 3] if kind == "all" else [1, 2])}
+    if failure in ("missing", "original", "later"):
+        expected_thumbnails.remove(preview_url(1))
+    if failure == "disabled":
+        expected_thumbnails.clear()
+    assert thumbnails == expected_thumbnails
     assert len(packets[0]) == 2
-    assert sum("ugoira_meta" in url for url in requests) == 1
     node = packets[0][0]
-    if failure in ("static", "blur"):
+    if failure:
         assert isinstance(node.data["content"], str)
-        assert "类型：图片（动图）" in node.data["content"]
+        content = node.data["content"]
     else:
-        assert "类型：图片（动图）" in node.data["content"][0].data["text"]
+        content = node.data["content"][0].data["text"]
         data = image_bytes(node)
-        if failure:
-            assert data == message.process_preview(static, True, 512)
-            assert data != message.process_preview(static, False, 512)
-        else:
-            with Image.open(BytesIO(data)) as gif:
-                assert gif.is_animated
-                assert gif.size == (256, 128)
+        assert data == blurred
+        assert data != plain
+        with Image.open(BytesIO(data)) as image:
+            assert image.format == "JPEG"
+            assert image.size == (300, 160)
+    assert content.startswith("[1]\n")
+    assert "类型：图片（动图）" in content
+    assert "PID：1" in content
+    if failure != "disabled":
+        assert packets[0][1].data["content"][0].data["text"].startswith("[2]\n")
+        assert image_bytes(packets[0][1]) == plain
+    if kind == "all":
+        assert isinstance(packets[-1][0].data["content"], str)
+        assert "小说 ID：4" in packets[-1][0].data["content"]
 
 
 def make_event(group: bool):
@@ -203,7 +277,7 @@ def test_download_original_once_and_independent_outputs(
         return httpx.Response(200, content=archive_data)
 
     async def convert(archive, received, output):
-        """验证转换使用已发送的同一个原始 ZIP，且不套用预览配置
+        """验证转换使用已发送的同一个原始 ZIP，且保留完整动图元数据
 
         Args:
             archive: 命令层传入的已下载原始资源路径
@@ -289,8 +363,6 @@ def test_download_original_once_and_independent_outputs(
         config = Config(
             pixiv_cookie="PHPSESSID=test",
             pixiv_r18=failure != "r18",
-            pixiv_ugoira_preview_max_frames=1,
-            pixiv_ugoira_preview_max_edge=64,
         )
         client = PixivClient(config, httpx.MockTransport(handler))
         monkeypatch.setattr(commands, "config", config)
@@ -347,50 +419,3 @@ def test_download_original_once_and_independent_outputs(
             }
             assert actions[-1] == expected[failure]
 
-
-def test_ugoira_preview_concurrency_is_separate_and_bounded(monkeypatch) -> None:
-    """验证多个动图 GIF 串行处理且不会增加普通图片的详情请求
-
-    Args:
-        monkeypatch: 替换动图网络和预览处理的 pytest 工具
-    """
-    data, meta = make_archive()
-    active = 0
-    peak = 0
-
-    async def handler(request):
-        """响应多部动图搜索及各自的预览 ZIP
-
-        Args:
-            request: 本次搜索，元数据或预览资源请求
-
-        Returns:
-            对应请求的成功响应
-        """
-        if "/ajax/search/" in request.url.path:
-            return ajax({"illust": {"data": [{"id": i, "illustType": 2} for i in range(3)]}})
-        if request.url.path.endswith("/ugoira_meta"):
-            return ajax(meta_body(meta))
-        assert str(request.url) == meta.src
-        return httpx.Response(200, content=data)
-
-    async def build(*args):
-        """记录 GIF 编码同时占用的数量
-
-        Args:
-            args: 由命令层传入的预览源和处理配置
-
-        Returns:
-            用于转发节点构造的预览字节
-        """
-        nonlocal active, peak
-        active += 1
-        peak = max(peak, active)
-        await asyncio.sleep(0.01)
-        active -= 1
-        return b"gif"
-
-    monkeypatch.setattr(ugoira, "preview_semaphore", asyncio.Semaphore(1))
-    monkeypatch.setattr(ugoira, "build_preview", build)
-    asyncio.run(run_search(monkeypatch, handler))
-    assert peak == 1

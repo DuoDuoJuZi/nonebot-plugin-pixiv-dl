@@ -60,11 +60,9 @@ PIXIV_PROXY="http://127.0.0.1:7890"
 | `PIXIV_COOKIE` | 空 | Pixiv 登录 Cookie |
 | `PIXIV_R18` | `true` | 是否允许搜索和下载 R18 作品 |
 | `PIXIV_SEARCH_LIMIT` | `20` | 每批各分类的搜索结果上限 |
-| `PIXIV_SEARCH_PREVIEW` | `true` | 是否显示插图和漫画的静态或动图预览 |
+| `PIXIV_SEARCH_PREVIEW` | `true` | 是否显示插图，漫画和动图的静态缩略图 |
 | `PIXIV_PREVIEW_CONCURRENCY` | `4` | 静态预览处理并发数，范围为 `1` 至 `16` |
 | `PIXIV_PREVIEW_MAX_EDGE` | `512` | 静态预览最长边像素上限，范围为 `64` 至 `1024` |
-| `PIXIV_UGOIRA_PREVIEW_MAX_EDGE` | `256` | 动图 GIF 预览最长边像素上限，范围为 `64` 至 `512` |
-| `PIXIV_UGOIRA_PREVIEW_MAX_FRAMES` | `60` | 动图 GIF 预览帧数上限，范围为 `1` 至 `120` |
 | `PIXIV_FORWARD_MAX_MESSAGES` | `20` | 每包转发的节点上限，最小为 `2` |
 | `PIXIV_DOWNLOAD_MAX_PAGES` | `30` | 漫画单次下载的页数上限 |
 | `PIXIV_NOVEL_MAX_CHAPTERS` | `50` | 小说系列单次下载的章节上限 |
@@ -96,7 +94,7 @@ PIXIV_PROXY="http://127.0.0.1:7890"
 
 参数前可省略空格，例如 `/px搜索图片风景` 和 `/px下载图片123456`
 
-- 搜索结果以合并转发发送，插图和漫画默认附带预览，动图使用 GIF，无可用预览时仅展示作品信息
+- 搜索结果以合并转发发送，插图和漫画默认附带预览，动图使用静态缩略图，无可用预览时仅展示作品信息
 - 静态插图和漫画按页发送原图，小说按章节发送 TXT 文件，超出转发节点上限自动分包
 - 结果记录保留 60 秒，翻页和下载不会延长，新搜索或成功发送的相关结果从 1 重新编号
 - 聚合搜索使用分类翻页命令成功后，仅继续该分类，切换分类需重新搜索

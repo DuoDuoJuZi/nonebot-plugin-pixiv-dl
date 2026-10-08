@@ -366,11 +366,15 @@ def test_unavailable_or_disabled_preview_makes_no_image_request(
     assert isinstance(packets[0][0].data["content"], str)
 
 
-def test_preview_concurrency_is_bounded_and_preserves_result_order(monkeypatch) -> None:
-    """验证预览最多同时请求四张且下载完成顺序不会改变作品节点顺序
+@pytest.mark.parametrize("illust_type", [0, 2])
+def test_preview_concurrency_is_bounded_and_preserves_result_order(
+    monkeypatch, illust_type: int
+) -> None:
+    """验证普通图片与动图共用并发上限且下载完成顺序不会改变作品节点顺序
 
     Args:
         monkeypatch: 用于临时替换请求客户端与消息接口的 pytest 工具
+        illust_type: 奇数编号作品的 Pixiv 类型，用于检查混合动图预览
     """
     active = 0
     peak = 0
@@ -387,7 +391,14 @@ def test_preview_concurrency_is_bounded_and_preserves_result_order(monkeypatch) 
         """
         nonlocal active, peak
         if request.url.host == "www.pixiv.net":
-            items = [{"id": str(index), "url": preview_url(index)} for index in range(1, 9)]
+            items = [
+                {
+                    "id": str(index),
+                    "url": preview_url(index),
+                    "illustType": illust_type if index % 2 else 0,
+                }
+                for index in range(1, 9)
+            ]
             return httpx.Response(200, json={"error": False, "body": {"illust": {"data": items}}})
         work_id = int(request.url.path.rsplit("/", 1)[1].split("_", 1)[0])
         active += 1
@@ -427,7 +438,7 @@ def test_preview_config_defaults_and_limits() -> None:
 
 @pytest.mark.parametrize("kind", ["image", "manga", "novel", "all"])
 def test_next_page_preserves_previews_blur_metadata_and_packets(monkeypatch, kind: str) -> None:
-    """验证真实客户端翻页仍共用预览处理和按作品分包的展示流程
+    """验证图片和动图翻页共用静态预览处理，小说保持元数据并按作品分包
 
     Args:
         monkeypatch: 临时替换外部网络与 OneBot 发送接口的 pytest 工具
@@ -466,7 +477,7 @@ def test_next_page_preserves_previews_blur_metadata_and_packets(monkeypatch, kin
                     "id": page * 10 + index,
                     "title": f"作品 {index}",
                     "userName": "作者",
-                    "illustType": illust_type,
+                    "illustType": 2 if route == "illustrations" and index == 1 else illust_type,
                     "pageCount": 22,
                     "url": preview_url(page * 10 + index),
                     "xRestrict": index == 1,
@@ -553,10 +564,13 @@ def test_next_page_preserves_previews_blur_metadata_and_packets(monkeypatch, kin
         else:
             assert "PID：21" in nodes[0].data["content"][0].data["text"]
             assert "作品总页数：22" in nodes[0].data["content"][0].data["text"]
+            if category == "image":
+                assert "类型：图片（动图）" in nodes[0].data["content"][0].data["text"]
             blurred = image_bytes(nodes[0])
             assert blurred == message.process_preview(data, True, 512)
             assert blurred != message.process_preview(data, False, 512)
             with Image.open(BytesIO(blurred)) as image:
+                assert image.format == "JPEG"
                 assert image.size == (512, 256)
     search_requests = [request for request in requests if request.url.host == "www.pixiv.net"]
     assert [request.url.params["p"] for request in search_requests] == ["1"] * len(kinds) + [

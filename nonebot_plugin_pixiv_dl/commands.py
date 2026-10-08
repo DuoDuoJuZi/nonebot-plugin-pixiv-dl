@@ -127,10 +127,10 @@ async def _search_kind(kind: str, word: str, page: int) -> SearchPage:
 
 
 async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
-    """有限并发处理静态与动态预览，动图失败时降级为安全静态预览
+    """有限并发处理第一页静态缩略图，动图与普通图片共用预览流程
 
     Args:
-        items: 按搜索顺序排列的插画或漫画元数据
+        items: 按结果顺序排列的插画，动图或漫画元数据
 
     Returns:
         按作品 ID 保存的成功处理预览，关闭预览时返回空字典
@@ -145,24 +145,8 @@ async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
             item: 包含预览地址与限制级标记的作品元数据
 
         Returns:
-            已处理的 GIF 或 JPEG 内容，所有预览尝试均失败时返回 None
+            已处理的静态 JPEG 内容，没有缩略图或处理失败时返回 None
         """
-        if item.is_ugoira:
-            try:
-                async with ugoira.preview_semaphore:
-                    meta = await client.get_ugoira_meta(item.id)
-                    with TemporaryDirectory(prefix="nonebot-pixiv-preview-") as directory:
-                        path = Path(directory) / "preview.zip"
-                        await client.download_ugoira_archive(
-                            meta.src, path, ugoira.PREVIEW_ARCHIVE_LIMIT
-                        )
-                        return await ugoira.build_preview(
-                            path, meta, item.is_r18,
-                            config.pixiv_ugoira_preview_max_edge,
-                            config.pixiv_ugoira_preview_max_frames,
-                        )
-            except Exception:
-                logger.exception("Pixiv Ugoira GIF 预览失败，作品 ID={}", item.id)
         if not item.preview_url:
             return None
         try:

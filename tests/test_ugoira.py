@@ -11,7 +11,7 @@ from zipfile import ZipFile, ZipInfo
 
 import pytest
 from imageio_ffmpeg import get_ffmpeg_exe
-from PIL import Image, ImageChops, ImageSequence
+from PIL import Image
 
 from nonebot_plugin_pixiv_dl import ugoira
 from nonebot_plugin_pixiv_dl.models import UgoiraFrame, UgoiraMeta
@@ -60,51 +60,8 @@ def make_archive(
     )
 
 
-@pytest.mark.parametrize("restricted", [False, True])
-def test_gif_sampling_timing_and_every_frame_blur(tmp_path: Path, restricted: bool) -> None:
-    """验证完整范围采样，尺寸限制，总时长及每帧模糊结果
-
-    Args:
-        tmp_path: 当前测试独占的临时目录
-        restricted: 是否验证逐帧限制级模糊
-    """
-    data, meta = make_archive(100, (321, 161))
-    archive = tmp_path / "preview.zip"
-    archive.write_bytes(data)
-    result = ugoira.build_preview_gif(archive, meta, restricted, 128, 20)
-    plain = ugoira.build_preview_gif(archive, meta, False, 128, 20)
-    with Image.open(BytesIO(result)) as gif, Image.open(BytesIO(plain)) as baseline:
-        assert gif.is_animated
-        assert gif.n_frames == 20
-        assert max(gif.size) <= 128
-        duration = 0
-        for index, frame in enumerate(ImageSequence.Iterator(gif)):
-            duration += frame.info["duration"]
-            baseline.seek(index)
-            if restricted:
-                difference = ImageChops.difference(frame.convert("RGB"), baseline.convert("RGB"))
-                assert difference.getbbox()
-        assert abs(duration - sum(frame.delay for frame in meta.frames)) <= 10
-        assert gif.info["loop"] == 0
-
-
-def test_short_gif_keeps_all_frames(tmp_path: Path) -> None:
-    """验证小于预览帧数上限的动图保留所有不同帧
-
-    Args:
-        tmp_path: 当前测试独占的临时目录
-    """
-    data, meta = make_archive()
-    archive = tmp_path / "preview.zip"
-    archive.write_bytes(data)
-    result = ugoira.build_preview_gif(archive, meta, False, 256, 60)
-    with Image.open(BytesIO(result)) as image:
-        assert image.n_frames == 3
-        assert image.size == (65, 33)
-
-
 def test_full_timeline_uses_metadata_order_all_frames_and_delays(tmp_path: Path) -> None:
-    """验证正式转换忽略预览上限并完整保留乱序 ZIP 的动画时序
+    """验证正式转换完整保留乱序 ZIP 的动画时序
 
     Args:
         tmp_path: 当前测试独占的临时目录
@@ -429,22 +386,6 @@ def test_formal_conversion_rejects_resize_and_corrupt_frames(
         target.writestr(meta.frames[1].file, encoded)
     with pytest.raises(ugoira.UgoiraError):
         asyncio.run(ugoira.convert_to_mp4(archive_path, meta, tmp_path / "output.mp4"))
-
-
-def test_gif_quantization_preserves_total_or_falls_back(tmp_path: Path) -> None:
-    """验证短尾帧不会累计拉长 GIF，无可表示的短时序会明确失败
-
-    Args:
-        tmp_path: 当前测试独占的临时目录
-    """
-    data, meta = make_archive(3, delays=[100, 1, 1])
-    path = tmp_path / "preview.zip"
-    path.write_bytes(data)
-    with Image.open(BytesIO(ugoira.build_preview_gif(path, meta, False, 256, 60))) as gif:
-        assert sum(frame.info["duration"] for frame in ImageSequence.Iterator(gif)) == 100
-    _, short_meta = make_archive(3, delays=[1])
-    with pytest.raises(ugoira.UgoiraError, match="时序过短"):
-        ugoira.build_preview_gif(path, short_meta, False, 256, 60)
 
 
 def test_stuck_process_is_killed_and_reaped() -> None:
