@@ -170,8 +170,8 @@ def test_search_downloads_only_p0_and_keeps_preview_in_metadata_node(
         return httpx.Response(200, content=data, headers={"content-type": "image/png"})
 
     packets = asyncio.run(run_search(monkeypatch, handler, kind, pixiv_forward_max_messages=2))
-    assert [len(packet) for packet in packets] == [2, 1]
-    nodes = [node for packet in packets for node in packet]
+    assert [len(packet) for packet in packets] == [3, 2]
+    nodes = [node for packet in packets for node in packet[:-1]]
     for index, node in enumerate(nodes, 1):
         assert f"PID：{index}\n" in node.data["content"][0].data["text"]
         with Image.open(BytesIO(image_bytes(node))) as image:
@@ -316,7 +316,7 @@ def test_preview_failure_keeps_metadata_and_never_sends_raw_r18(monkeypatch, fai
         return httpx.Response(200, content=data, headers={"content-type": "image/png"})
 
     packets = asyncio.run(run_search(monkeypatch, handler))
-    assert len(packets[0]) == 2
+    assert len(packets[0]) == 3
     assert isinstance(packets[0][0].data["content"], str)
     assert "PID：1" in packets[0][0].data["content"]
     assert image_bytes(packets[0][1])
@@ -414,23 +414,27 @@ def test_preview_concurrency_is_bounded_and_preserves_result_order(
     packets = asyncio.run(run_search(monkeypatch, handler))
     assert peak == 4
     assert completed != list(range(1, 9))
-    for index, node in enumerate(packets[0], 1):
+    for index, node in enumerate(packets[0][:-1], 1):
         assert f"PID：{index}\n" in node.data["content"][0].data["text"]
         with Image.open(BytesIO(image_bytes(node))) as image:
             assert abs(image.getpixel((32, 16))[0] - index * 20) <= 3
 
 
 def test_preview_config_defaults_and_limits() -> None:
-    """验证预览默认开启且并发和尺寸配置拒绝越界值"""
+    """验证预览与分包默认配置及对应上限，拒绝越界值"""
     config = Config()
     assert config.pixiv_search_preview is True
     assert config.pixiv_preview_concurrency == 4
     assert config.pixiv_preview_max_edge == 512
+    assert config.pixiv_forward_max_messages == 20
+    assert Config(pixiv_forward_max_messages=99).pixiv_forward_max_messages == 99
     for options in (
         {"pixiv_preview_concurrency": 0},
         {"pixiv_preview_concurrency": 17},
         {"pixiv_preview_max_edge": 63},
         {"pixiv_preview_max_edge": 1025},
+        {"pixiv_forward_max_messages": 1},
+        {"pixiv_forward_max_messages": 100},
     ):
         with pytest.raises(ValidationError):
             Config(**options)
@@ -549,11 +553,13 @@ def test_next_page_preserves_previews_blur_metadata_and_packets(monkeypatch, kin
 
     asyncio.run(scenario())
     assert actions[:2] == [("message", "正在搜索"), ("recall", 77)]
-    assert [len(packet) for packet in packets] == [2, 1] * len(kinds)
-    assert "第 2 页" in actions[-1][1]
-    assert "已经没有下一页" in actions[-1][1]
+    assert [len(packet) for packet in packets] == [3, 2] * len(kinds)
+    assert all(action[0] == "forward" for action in actions[2:])
     for index, category in enumerate(kinds):
-        nodes = packets[index * 2] + packets[index * 2 + 1]
+        first, last = packets[index * 2 : index * 2 + 2]
+        assert first[-1].data["content"] == "[提示]\n本次结果还有后续分包，将自动发送"
+        assert last[-1].data["content"] == f"[提示]\n{message.KIND_NAMES[category]}已是最后一页"
+        nodes = first[:-1] + last[:-1]
         assert all(
             node.data["nickname"] == f"Pixiv {message.KIND_NAMES[category]}" for node in nodes
         )

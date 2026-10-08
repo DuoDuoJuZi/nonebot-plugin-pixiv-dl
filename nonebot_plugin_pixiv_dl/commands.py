@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from nonebot import get_driver, get_plugin_config, logger, on_regex
-from nonebot.adapters.onebot.v11 import Bot, MessageEvent
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment
 
 from . import pagination, ugoira
 from .config import Config
@@ -168,29 +168,21 @@ async def _search_previews(items: list[Artwork]) -> dict[int, bytes]:
     return {item.id: data for item, data in zip(items, previews, strict=True) if data is not None}
 
 
-def _pagination_hint(session: SearchSession) -> str:
-    """根据独立分类游标生成真实可用的翻页提示
+def _pagination_hint(session: SearchSession, kind: str) -> str:
+    """根据当前分类游标和搜索模式生成尾部翻页提示
 
     Args:
         session: 保存当前模式和成功查询页码的分页记录
+        kind: 当前合并转发所属的搜索分类
 
     Returns:
-        当前页码和仍然允许使用的翻页命令，无剩余页时说明已结束
+        当前分类可用的翻页命令，无剩余页时说明已结束
     """
-    pages = "，".join(
-        f"{KIND_NAMES[kind]}第 {cursor.page} 页"
-        for kind, cursor in session.cursors.items()
-        if cursor.page
-    )
-    available = [kind for kind, cursor in session.cursors.items() if cursor.has_next]
-    if not available:
-        return f"当前{pages}，已经没有下一页"
-    names = "、".join(KIND_NAMES[kind] for kind in available)
-    branches = " 或 ".join(f"/px搜索{KIND_NAMES[kind]}下一页" for kind in available)
-    choice = "，选择分类成功后仅继续该分类" if session.kind == "all" else ""
-    return (
-        f"当前{pages}\n{names}还有下一页，可使用 /px搜索下一页 继续搜索，或使用 {branches}{choice}"
-    )
+    name = KIND_NAMES[kind]
+    if not session.cursors[kind].has_next:
+        return f"{name}已是最后一页"
+    branch = f" 或 /px搜索{name}下一页" if session.kind == "all" else " 继续搜索"
+    return f"{name}还有下一页，可使用 /px搜索下一页{branch}"
 
 
 async def _send_result_packets(
@@ -200,8 +192,9 @@ async def _send_result_packets(
     items: list[Artwork] | list[Novel],
     previews: dict[int, bytes],
     previous: SearchSession | None,
+    pagination_hint: str | None = None,
 ) -> None:
-    """逐包发送并登记结果，首包成功后才替换原会话
+    """逐包发送并仅登记作品，首包成功后才替换原会话并开始固定有效期
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例
@@ -210,6 +203,7 @@ async def _send_result_packets(
         items: 按接口原始顺序排列的作品元数据
         previews: 按作品 ID 保存的可用预览
         previous: 发送前应保持不变的会话，首次查询时可为空
+        pagination_hint: 当前分类最后一包的分页提示，空值表示相关作品不追加提示节点
     """
     key = session_key(bot, event)
     packets = build_search_forward(
@@ -220,14 +214,23 @@ async def _send_result_packets(
     for packet in packets:
         if sessions.get(key) is not previous:
             return
+        result_count = len(packet)
+        if pagination_hint is not None:
+            hint = (
+                "本次结果还有后续分包，将自动发送"
+                if offset + result_count < len(items) else pagination_hint
+            )
+            packet.append(
+                MessageSegment.node_custom(int(bot.self_id), "Pixiv 提示", f"[提示]\n{hint}")
+            )
         await send_forward(bot, event, packet)
         if sessions.get(key) is not previous:
             return
-        for item in items[offset : offset + len(packet)]:
+        for item in items[offset : offset + result_count]:
             kind = "novel" if isinstance(item, Novel) else item.type
             session.results[session.next_result_index] = SearchResultRef(kind, item.id)
             session.next_result_index += 1
-        offset += len(packet)
+        offset += result_count
         if session.expires_at is None:
             session.expires_at = pagination.monotonic() + pagination.SEARCH_SESSION_TTL
         sessions[key] = session
@@ -269,8 +272,6 @@ async def _search_and_send(
         }
         for kind, result in successful.items():
             session.cursors[kind] = SearchCursor(result.page, result.has_next)
-        if successful and session.expires_at is None:
-            session.expires_at = pagination.monotonic() + pagination.SEARCH_SESSION_TTL
         if selected in successful:
             session.kind = selected
             session.cursors = {selected: session.cursors[selected]}
@@ -311,7 +312,8 @@ async def _search_and_send(
                     continue
                 try:
                     await _send_result_packets(
-                        bot, event, session, result.items, previews, session
+                        bot, event, session, result.items, previews, session,
+                        pagination_hint=_pagination_hint(session, current),
                     )
                 except Exception as exc:
                     logger.error(
@@ -326,15 +328,6 @@ async def _search_and_send(
                         type(exc).__name__,
                     )
                     await bot.send(event, f"{KIND_NAMES[current]}搜索结果发送失败")
-        if (
-            successful
-            and sessions.get(key) is session
-            and (
-                any(cursor.has_next for cursor in session.cursors.values())
-                or any(page > 1 for page in targets.values())
-            )
-        ):
-            await bot.send(event, _pagination_hint(session))
     except Exception as exc:
         logger.error(
             "Pixiv 搜索失败，关键词={}，当前页={}，目标页={}，上下文={}，聚合={}，异常={}",
@@ -355,7 +348,7 @@ async def _search_and_send(
 
 
 async def _run_search(bot: Bot, event: MessageEvent, kind: str, word: str) -> None:
-    """以新的搜索意图替换旧会话，首次查询成功后开始固定有效期
+    """以新的搜索意图替换旧会话，首包合并转发成功后开始固定有效期
 
     Args:
         bot: 用于调用 OneBot 消息接口的机器人实例

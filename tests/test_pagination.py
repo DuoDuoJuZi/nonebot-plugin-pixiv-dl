@@ -182,7 +182,10 @@ def test_single_category_pages(harness, kind: str, next_command: str) -> None:
 
     asyncio.run(scenario())
     assert harness.calls == [(commands.KINDS[kind], "关键词", page) for page in (1, 2, 3)]
-    assert "第 3 页" in harness.last_message()
+    assert harness.forward.call_args.args[2][-1].data["content"] == (
+        f"[提示]\n{kind}还有下一页，可使用 /px搜索下一页 继续搜索"
+    )
+    assert all(call.args[1] == "正在搜索" for call in harness.send.await_args_list)
     assert harness.recall.await_count == 3
     assert harness.forward.await_count == 3
     assert harness.session().results == {
@@ -197,6 +200,53 @@ def test_single_category_pages(harness, kind: str, next_command: str) -> None:
         call.args[2][0].data["content"].splitlines()[0]
         for call in harness.forward.await_args_list
     ] == ["[1]", "[2]", "[3]"]
+
+
+@pytest.mark.parametrize(
+    ("capacity", "count", "packet_sizes"),
+    [(20, 20, [21]), (99, 99, [100]), (20, 45, [21, 21, 6]), (99, 100, [100, 2])],
+)
+@pytest.mark.parametrize("has_next", [False, True])
+def test_search_packets_reserve_status_node(
+    harness, monkeypatch, capacity: int, count: int, packet_sizes: list[int], has_next: bool
+) -> None:
+    """验证搜索容量只计算作品，每包尾部状态不影响连续编号和作品引用
+
+    Args:
+        harness: 记录请求与状态的命令测试环境
+        monkeypatch: 替换搜索结果及分包容量的 pytest 工具
+        capacity: 每包允许展示的作品数量
+        count: 本次搜索实际返回的作品数量
+        packet_sizes: 含尾部状态节点的各包预期总节点数
+        has_next: 当前分类是否仍有后续 Pixiv 页
+    """
+    items = [
+        Artwork(index, "画作", 2, "作者", [], "image", 1, 0) for index in range(101, 101 + count)
+    ]
+    monkeypatch.setattr(commands.config, "pixiv_forward_max_messages", capacity)
+    monkeypatch.setattr(
+        commands, "_search_kind", AsyncMock(return_value=SearchPage(items, 1, has_next))
+    )
+    asyncio.run(harness.run("/px搜索图片 关键词"))
+    packets = [call.args[2] for call in harness.forward.await_args_list]
+    assert [len(packet) for packet in packets] == packet_sizes
+    assert all(len(packet) <= 100 for packet in packets)
+    assert all(
+        packet[-1].data["content"] == "[提示]\n本次结果还有后续分包，将自动发送"
+        for packet in packets[:-1]
+    )
+    assert packets[-1][-1].data["content"] == (
+        "[提示]\n图片还有下一页，可使用 /px搜索下一页 继续搜索"
+        if has_next else "[提示]\n图片已是最后一页"
+    )
+    assert [node.data["content"].splitlines()[0] for packet in packets for node in packet[:-1]] == [
+        f"[{index}]" for index in range(1, count + 1)
+    ]
+    assert harness.session().results == {
+        index: pagination.SearchResultRef("image", item.id) for index, item in enumerate(items, 1)
+    }
+    assert harness.session().next_result_index == count + 1
+    assert [call.args[1] for call in harness.send.await_args_list] == ["正在搜索"]
 
 
 def test_result_numbers_commit_only_sent_packets(harness, monkeypatch) -> None:
@@ -229,6 +279,8 @@ def test_result_numbers_commit_only_sent_packets(harness, monkeypatch) -> None:
         """
         session = harness.session()
         assert packet[0].data["content"].startswith(f"[{session.next_result_index}]\n")
+        assert packet[-1].data["content"].startswith("[提示]\n")
+        assert len(packet) == (2 if harness.forward.await_count == 3 else 3)
         assert len(session.results) == session.next_result_index - 1
         if harness.forward.await_count == 2:
             raise RuntimeError("模拟发送失败")
@@ -319,7 +371,12 @@ def test_related_results_replace_context_and_can_be_followed(harness, monkeypatc
         ("manga", 22, commands.config.pixiv_search_limit),
         ("novel", 999, commands.config.pixiv_search_limit),
     ]
-    assert all(call.args[1] == "正在搜索" for call in harness.send.await_args_list[2:])
+    assert all(call.args[1] == "正在搜索" for call in harness.send.await_args_list)
+    assert [len(call.args[2]) for call in harness.forward.await_args_list[1:]] == [2, 1, 1]
+    assert all(
+        not node.data["content"].startswith("[提示]")
+        for call in harness.forward.await_args_list[1:] for node in call.args[2]
+    )
 
 
 @pytest.mark.parametrize("failure", ["request", "empty", "first_packet", "later_packet"])
@@ -403,8 +460,13 @@ def test_aggregate_next_skips_exhausted_categories(harness, ended: bool) -> None
     async def scenario():
         """查询聚合前两批并检查提示中的可用分支"""
         await harness.run("/px搜索 关键词")
-        if ended:
-            assert "/px搜索漫画下一页" not in harness.last_message()
+        assert [call.args[2][-1].data["content"] for call in harness.forward.await_args_list] == [
+            "[提示]\n图片还有下一页，可使用 /px搜索下一页 或 /px搜索图片下一页",
+            "[提示]\n漫画已是最后一页" if ended else (
+                "[提示]\n漫画还有下一页，可使用 /px搜索下一页 或 /px搜索漫画下一页"
+            ),
+            "[提示]\n小说还有下一页，可使用 /px搜索下一页 或 /px搜索小说下一页",
+        ]
         await harness.run("/px搜索下一页")
 
     asyncio.run(scenario())
@@ -415,6 +477,7 @@ def test_aggregate_next_skips_exhausted_categories(harness, ended: bool) -> None
     ]
     session = harness.session()
     assert session.kind == "all"
+    assert all(call.args[1] == "正在搜索" for call in harness.send.await_args_list)
     references = [
         *(pagination.SearchResultRef(kind, 1) for kind in commands.KINDS.values()),
         *(pagination.SearchResultRef(kind, 2) for kind in kinds),
@@ -461,8 +524,9 @@ def test_aggregate_selects_novel_from_current_page(harness, aggregate_next: bool
     asyncio.run(scenario())
     start = 3 if aggregate_next else 2
     assert harness.calls[-2:] == [("novel", "关键词", start), ("novel", "关键词", start + 1)]
-    assert "/px搜索图片下一页" not in harness.last_message()
-    assert "/px搜索漫画下一页" not in harness.last_message()
+    assert harness.forward.call_args.args[2][-1].data["content"] == (
+        "[提示]\n小说还有下一页，可使用 /px搜索下一页 继续搜索"
+    )
     assert [call.args[2:] for call in harness.download.await_args_list] == [
         (kind, 1) for kind in commands.KINDS.values()
     ]
@@ -838,28 +902,115 @@ def test_pagination_error_logs_context(harness, monkeypatch) -> None:
     )
 
 
-def test_expiry_starts_after_initial_search_success(harness) -> None:
-    """验证初次网络等待不消耗尚未建立的会话有效期
+@pytest.mark.parametrize("first_packet_fails", [False, True])
+def test_expiry_starts_after_first_packet_success(
+    harness, monkeypatch, first_packet_fails: bool
+) -> None:
+    """验证首包成功前不计时，后续分包与聚合分类不延长固定有效期
 
     Args:
         harness: 记录请求与状态的命令测试环境
+        monkeypatch: 替换预览处理及分包容量的 pytest 工具
+        first_packet_fails: 是否让图片首包失败并从漫画首包成功时开始计时
     """
+    first_sent_at = None
+
+    async def search(kind, word, page):
+        """复用可控搜索请求并让图片结果超过单包容量
+
+        Args:
+            kind: 当前请求的作品分类
+            word: 用于匹配模拟搜索等待条件的关键词
+            page: 当前请求的 Pixiv 页码
+
+        Returns:
+            图片含三个作品且其他分类含一个作品的模拟搜索结果
+        """
+        result = await harness.search(kind, word, page)
+        items = (
+            [Artwork(index, "画作", 2, "作者", [], "image", 1, 0) for index in range(10, 13)]
+            if kind == "image" else result.items
+        )
+        return SearchPage(items, result.page, result.has_next)
+
+    async def previews(items):
+        """模拟预览处理超过有效期长度且此时尚未开始计时
+
+        Args:
+            items: 等待预览处理的图片与漫画搜索结果
+
+        Returns:
+            无可用图片内容的预览集合
+        """
+        assert harness.session().expires_at is None
+        harness.now += 61
+        return {}
+
+    async def forward(bot, event, packet):
+        """推进发送耗时并验证仅首次发送成功建立有效期
+
+        Args:
+            bot: 用于发送当前分包的机器人实例
+            event: 决定搜索会话的消息事件
+            packet: 包含作品和尾部状态的待发送节点
+
+        Raises:
+            RuntimeError: 当前场景要求图片首包发送失败
+        """
+        nonlocal first_sent_at
+        assert harness.session().expires_at == (
+            None if first_sent_at is None else first_sent_at + 60
+        )
+        harness.now += 5
+        if first_packet_fails and harness.forward.await_count == 1:
+            raise RuntimeError("模拟发送失败")
+        if first_sent_at is None:
+            first_sent_at = harness.now
+
+    monkeypatch.setattr(commands.config, "pixiv_forward_max_messages", 2)
+    monkeypatch.setattr(commands, "_search_kind", search)
+    monkeypatch.setattr(commands, "_search_previews", previews)
+    harness.forward.side_effect = forward
 
     async def scenario():
-        """在首次请求期间推进时间并检查成功后的完整有效期"""
+        """在请求与预览及发送阶段推进时间并检查首包成功后的固定有效期"""
         entered, release = asyncio.Event(), asyncio.Event()
         harness.gates[("关键词", "image", 1)] = (entered, release)
-        first = asyncio.create_task(harness.run("/px搜索图片 关键词"))
+        first = asyncio.create_task(harness.run("/px搜索 关键词"))
         await entered.wait()
         assert harness.session().expires_at is None
         harness.now += 61
         release.set()
         await first
-        assert harness.session().expires_at == harness.now + 60
-        await harness.run("/px搜索下一页")
+        assert first_sent_at is not None
+        assert harness.session().expires_at == first_sent_at + 60
+        assert harness.now > first_sent_at
 
     asyncio.run(scenario())
-    assert [page for _, _, page in harness.calls] == [1, 2]
+    assert harness.forward.await_count == (3 if first_packet_fails else 4)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_initial_search_without_sent_results_releases_session(
+    harness, monkeypatch, empty: bool
+) -> None:
+    """验证空结果或全部发送失败不留下无有效期的会话，也不创建纯提示分包
+
+    Args:
+        harness: 记录请求与状态的命令测试环境
+        monkeypatch: 替换空结果查询的 pytest 工具
+        empty: 是否返回空结果，否则模拟合并转发发送失败
+    """
+    if empty:
+        monkeypatch.setattr(
+            commands, "_search_kind", AsyncMock(return_value=SearchPage([], 1, False))
+        )
+    else:
+        harness.forward.side_effect = RuntimeError("模拟发送失败")
+    asyncio.run(harness.run("/px搜索图片 关键词"))
+    assert not pagination.sessions
+    assert harness.forward.await_count == (0 if empty else 1)
+    assert harness.last_message() == ("没有搜索到相关内容" if empty else "图片搜索结果发送失败")
 
 
 @pytest.mark.parametrize("queued_command", ["/px搜索下一页", "/px下载 1"])
