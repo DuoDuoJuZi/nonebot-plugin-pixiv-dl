@@ -49,7 +49,7 @@ def meta_body(meta) -> dict:
 def test_search_ugoira_static_preview_and_safe_failure(
     monkeypatch, kind: str, failure: str | None
 ) -> None:
-    """验证搜索和相关作品只取静态缩略图，失败时保留元数据与编号
+    """验证动图静态预览保留元数据与编号，仅搜索追加尾部提示
 
     Args:
         monkeypatch: 替换网络和注入预览故障的 pytest 工具
@@ -181,7 +181,9 @@ def test_search_ugoira_static_preview_and_safe_failure(
     if failure == "disabled":
         expected_thumbnails.clear()
     assert thumbnails == expected_thumbnails
-    assert len(packets[0]) == 2
+    assert len(packets[0]) == (2 if kind == "related" else 3)
+    if kind != "related":
+        assert packets[0][-1].data["content"] == "[提示]\n图片已是最后一页"
     node = packets[0][0]
     if failure:
         assert isinstance(node.data["content"], str)
