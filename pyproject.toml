@@ -33,6 +33,7 @@ include = ["nonebot_plugin_pixiv_dl*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
