@@ -18,7 +18,7 @@ dependencies = [
     "httpcore>=1,<2",
     "pydantic>=1.10,<3",
     "Pillow>=10,<13",
-    "imageio-ffmpeg>=0.6,<0.7",
+    "imageio-ffmpeg>=0.8,<0.9",
     "anyio>=3.7,<5",
 ]
 
