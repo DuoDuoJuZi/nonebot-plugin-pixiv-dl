@@ -1,11 +1,7 @@
 from ipaddress import ip_address
 
+from nonebot.compat import field_validator
 from pydantic import BaseModel, Field
-
-try:
-    from pydantic import field_validator
-except ImportError:
-    from pydantic import validator as field_validator
 
 
 # @Author: DuoDuoJuZi
